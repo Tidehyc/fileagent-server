@@ -26,6 +26,16 @@ namespace fileagent
         std::string created_at;
     };
 
+    struct ShareRecord
+    {
+        std::int64_t id{0};
+        std::int64_t file_id{0};
+        std::int64_t user_id{0};
+        std::string share_token;
+        std::string expires_at;
+        std::string created_at;
+    };
+
     struct FileRecord
     {
         std::int64_t id{0};

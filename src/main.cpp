@@ -14,6 +14,7 @@
 #include "common/Logger.h"
 #include "common/Types.h"
 #include "dao/FileDao.h"
+#include "dao/ShareDao.h"
 #include "dao/SessionDao.h"
 #include "dao/UserDao.h"
 #include "db/ConnectionPool.h"
@@ -21,6 +22,7 @@
 #include "service/AuthService.h"
 #include "service/ChunkUploadService.h"
 #include "service/FileService.h"
+#include "service/ShareService.h"
 
 using namespace drogon;
 using namespace fileagent;
@@ -421,8 +423,8 @@ namespace
     if (static_cast<int>(session->received.size()) != session->total_chunks)
     {
       callback(makeJsonResponse(400, "not all chunks received: " +
-          std::to_string(session->received.size()) + "/" +
-          std::to_string(session->total_chunks)));
+                                         std::to_string(session->received.size()) + "/" +
+                                         std::to_string(session->total_chunks)));
       return;
     }
 
@@ -717,6 +719,147 @@ namespace
     callback(makeJsonResponse(0, "delete success"));
   }
 
+  // ─── 分享链接 ──────────────────────────────────
+
+  // POST /api/shares  (auth)
+  void handleShareCreate(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&callback)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    auto json = req->getJsonObject();
+    if (!json)
+    {
+      callback(makeJsonResponse(400, "request body must be JSON"));
+      return;
+    }
+
+    std::int64_t file_id = (*json)["file_id"].asInt64();
+    int expire_hours = (*json)["expire_hours"].asInt();
+
+    ShareService share_service;
+    auto result = share_service.createShare(user_id, file_id, expire_hours);
+    if (!result.success)
+    {
+      callback(makeJsonResponse(400, result.message));
+      return;
+    }
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody("{\"code\":0,\"message\":\"share created\",\"share_token\":\"" +
+                  *result.data + "\",\"url\":\"/api/shares/" + *result.data + "\"}");
+    callback(resp);
+  }
+
+  // GET /api/shares/{token}  (public)
+  void handleShareAccess(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&callback,
+                         const std::string &token)
+  {
+    ShareDao share_dao;
+    auto share = share_dao.findByToken(token);
+    if (!share.has_value())
+    {
+      callback(makeJsonResponse(404, "share not found or expired"));
+      return;
+    }
+
+    FileService file_service;
+    auto file_result = file_service.getFileById(share->file_id);
+    if (!file_result.success)
+    {
+      callback(makeJsonResponse(404, "file not found"));
+      return;
+    }
+
+    auto &file = *file_result.data;
+    if (!std::filesystem::exists(file.storage_path))
+    {
+      callback(makeJsonResponse(404, "file not found on disk"));
+      return;
+    }
+
+    auto resp = HttpResponse::newFileResponse(file.storage_path);
+    resp->addHeader("Content-Disposition", "attachment; filename=\"" + file.filename + "\"");
+    callback(resp);
+  }
+
+  // DELETE /api/shares/{token}  (auth)
+  void handleShareDelete(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&callback,
+                         const std::string &token)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    ShareDao share_dao;
+    auto share = share_dao.findByToken(token);
+    if (!share.has_value())
+    {
+      callback(makeJsonResponse(404, "share not found"));
+      return;
+    }
+    if (share->user_id != user_id)
+    {
+      callback(makeJsonResponse(403, "access denied"));
+      return;
+    }
+
+    share_dao.deleteByToken(token);
+    callback(makeJsonResponse(0, "share deleted"));
+  }
+
+  // GET /api/shares  (auth)
+  void handleShareList(const HttpRequestPtr &req,
+                       std::function<void(const HttpResponsePtr &)> &&callback)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    ShareDao share_dao;
+    auto shares = share_dao.listByUserId(user_id);
+
+    Json::Value shares_json(Json::arrayValue);
+    for (const auto &s : shares)
+    {
+      Json::Value item;
+      item["id"] = s.id;
+      item["file_id"] = s.file_id;
+      item["share_token"] = s.share_token;
+      item["url"] = "/api/shares/" + s.share_token;
+      item["expires_at"] = s.expires_at;
+      item["created_at"] = s.created_at;
+      shares_json.append(item);
+    }
+
+    Json::Value resp_json;
+    resp_json["code"] = 0;
+    resp_json["message"] = "query success";
+    resp_json["shares"] = shares_json;
+    resp_json["total"] = static_cast<int>(shares.size());
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
+    callback(resp);
+  }
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -803,6 +946,14 @@ int main(int argc, char *argv[])
   app().registerHandler("/api/files", &handleListFiles, {Get});
   app().registerHandler("/api/files/{fileId}", &handleDownload, {Get});
   app().registerHandler("/api/files/{fileId}", &handleDelete, {Delete});
+
+  // ─── 分享链接路由 ──────────────────────────────
+  // 访问分享是公开接口
+  app().registerHandler("/api/shares/{token}", &handleShareAccess, {Get});
+  // 其余需认证
+  app().registerHandler("/api/shares", &handleShareCreate, {Post});
+  app().registerHandler("/api/shares", &handleShareList, {Get});
+  app().registerHandler("/api/shares/{token}", &handleShareDelete, {Delete});
 
   // 启动
   app().addListener(app_config.server.host, app_config.server.port).setThreadNum(static_cast<unsigned int>(app_config.server.threads)).run();
