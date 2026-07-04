@@ -1,0 +1,11 @@
+{
+  "name": "fileagent-server",
+  "version": "1.0.0",
+  "dependencies": [
+    "drogon",
+    "nlohmann-json",
+    "yaml-cpp",
+    "gtest",
+    "openssl"
+  ]
+}

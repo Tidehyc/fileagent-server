@@ -1,0 +1,16 @@
+build/
+out/
+.vscode/
+.cache/
+uploads/
+vcpkg/
+vcpkg_installed/
+uploads/tmp/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+compile_commands.json
