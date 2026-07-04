@@ -19,6 +19,7 @@
 #include "db/ConnectionPool.h"
 #include "server/AuthMiddleware.h"
 #include "service/AuthService.h"
+#include "service/ChunkUploadService.h"
 #include "service/FileService.h"
 
 using namespace drogon;
@@ -293,6 +294,276 @@ namespace
     callback(resp);
   }
 
+  // ─── 分片上传 ──────────────────────────────────
+
+  // POST /api/files/upload/init
+  void handleChunkInit(const HttpRequestPtr &req,
+                       std::function<void(const HttpResponsePtr &)> &&callback)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    auto json = req->getJsonObject();
+    if (!json)
+    {
+      callback(makeJsonResponse(400, "request body must be JSON"));
+      return;
+    }
+
+    std::string filename = (*json)["filename"].asString();
+    std::int64_t file_size = (*json)["file_size"].asInt64();
+    int total_chunks = (*json)["total_chunks"].asInt();
+    int chunk_size = (*json)["chunk_size"].asInt();
+
+    if (filename.empty() || file_size <= 0 || total_chunks <= 0 || chunk_size <= 0)
+    {
+      callback(makeJsonResponse(400, "invalid parameters"));
+      return;
+    }
+
+    std::string upload_id = ChunkUploadManager::instance().createSession(
+        user_id, filename, file_size, total_chunks, chunk_size);
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody("{\"code\":0,\"message\":\"init success\",\"upload_id\":\"" + upload_id + "\"}");
+    callback(resp);
+  }
+
+  // POST /api/files/upload/{uploadId}/{chunkIndex}
+  void handleChunkUpload(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&callback,
+                         const std::string &uploadId,
+                         const std::string &chunkIndexStr)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    auto session = ChunkUploadManager::instance().getSession(uploadId);
+    if (!session || session->user_id != user_id)
+    {
+      callback(makeJsonResponse(404, "upload session not found"));
+      return;
+    }
+
+    int chunk_index = std::stoi(chunkIndexStr);
+    if (chunk_index < 0 || chunk_index >= session->total_chunks)
+    {
+      callback(makeJsonResponse(400, "invalid chunk index"));
+      return;
+    }
+
+    // 读取请求 body 作为分片数据
+    std::string chunk_data = std::string(req->getBody());
+
+    if (chunk_data.empty())
+    {
+      callback(makeJsonResponse(400, "empty chunk"));
+      return;
+    }
+
+    // 写入临时目录
+    std::string tmp_dir = "uploads/tmp/" + uploadId;
+    std::filesystem::create_directories(tmp_dir);
+
+    std::string chunk_path = tmp_dir + "/" + chunkIndexStr;
+    {
+      std::ofstream out(chunk_path, std::ios::binary);
+      if (!out)
+      {
+        callback(makeJsonResponse(500, "failed to write chunk"));
+        return;
+      }
+      out.write(chunk_data.data(), chunk_data.size());
+    }
+
+    ChunkUploadManager::instance().markChunkReceived(uploadId, chunk_index);
+
+    logDebug("ChunkUpload: received chunk " + chunkIndexStr + "/" +
+             std::to_string(session->total_chunks) + " for " + uploadId);
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody("{\"code\":0,\"message\":\"chunk received\"}");
+    callback(resp);
+  }
+
+  // POST /api/files/upload/{uploadId}/complete
+  void handleChunkComplete(const HttpRequestPtr &req,
+                           std::function<void(const HttpResponsePtr &)> &&callback,
+                           const std::string &uploadId)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    auto session = ChunkUploadManager::instance().getSession(uploadId);
+    if (!session || session->user_id != user_id)
+    {
+      callback(makeJsonResponse(404, "upload session not found"));
+      return;
+    }
+
+    // 检查所有分片是否已接收
+    if (static_cast<int>(session->received.size()) != session->total_chunks)
+    {
+      callback(makeJsonResponse(400, "not all chunks received: " +
+          std::to_string(session->received.size()) + "/" +
+          std::to_string(session->total_chunks)));
+      return;
+    }
+
+    std::string tmp_dir = "uploads/tmp/" + uploadId;
+
+    // 按 index 顺序合并文件
+    std::string merged_path = "uploads/tmp/" + uploadId + "_merged";
+    {
+      std::ofstream merged(merged_path, std::ios::binary);
+      if (!merged)
+      {
+        callback(makeJsonResponse(500, "failed to create merged file"));
+        return;
+      }
+
+      for (int i = 0; i < session->total_chunks; i++)
+      {
+        std::string chunk_path = tmp_dir + "/" + std::to_string(i);
+        std::ifstream chunk(chunk_path, std::ios::binary);
+        if (!chunk)
+        {
+          callback(makeJsonResponse(500, "failed to read chunk " + std::to_string(i)));
+          return;
+        }
+        merged << chunk.rdbuf();
+      }
+    }
+
+    // 计算 SHA-256
+    std::string merged_content;
+    {
+      std::ifstream merged_in(merged_path, std::ios::binary | std::ios::ate);
+      if (!merged_in)
+      {
+        callback(makeJsonResponse(500, "failed to read merged file"));
+        return;
+      }
+      auto size = merged_in.tellg();
+      merged_in.seekg(0);
+      merged_content.resize(static_cast<size_t>(size));
+      merged_in.read(merged_content.data(), size);
+    }
+
+    auto hash_bytes = trantor::utils::sha256(merged_content);
+    std::string file_hash = trantor::utils::toHexString(hash_bytes);
+
+    // 移动到最终存储路径
+    std::string storage_path;
+    if (file_hash.size() >= 2)
+    {
+      storage_path = "uploads/" + file_hash.substr(0, 2) + "/" + file_hash;
+    }
+    else
+    {
+      storage_path = "uploads/" + file_hash;
+    }
+
+    {
+      std::string dir_part = storage_path.substr(0, storage_path.find_last_of('/'));
+      std::filesystem::create_directories(dir_part);
+      std::filesystem::rename(merged_path, storage_path);
+    }
+
+    // 创建文件记录
+    FileRecord record;
+    record.user_id = user_id;
+    record.filename = session->filename;
+    record.file_hash = file_hash;
+    record.file_size = session->file_size;
+    record.storage_path = storage_path;
+    record.status = 1;
+
+    FileService file_service;
+    auto result = file_service.createFile(record);
+
+    // 清理临时目录
+    std::filesystem::remove_all(tmp_dir);
+    ChunkUploadManager::instance().removeSession(uploadId);
+
+    if (!result.success)
+    {
+      logError("handleChunkComplete: " + result.message);
+      callback(makeJsonResponse(500, result.message));
+      return;
+    }
+
+    logInfo("ChunkUpload: completed id=" + uploadId +
+            " file_id=" + std::to_string(result.data->id) +
+            " hash=" + file_hash);
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody("{\"code\":0,\"message\":\"upload complete\",\"file_id\":" +
+                  std::to_string(result.data->id) + ",\"hash\":\"" + file_hash + "\"}");
+    callback(resp);
+  }
+
+  // GET /api/files/upload/{uploadId}/status
+  void handleChunkStatus(const HttpRequestPtr &req,
+                         std::function<void(const HttpResponsePtr &)> &&callback,
+                         const std::string &uploadId)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+      return;
+    }
+
+    auto session = ChunkUploadManager::instance().getSession(uploadId);
+    if (!session || session->user_id != user_id)
+    {
+      callback(makeJsonResponse(404, "upload session not found"));
+      return;
+    }
+
+    // 构建已接收分片列表
+    Json::Value received_json(Json::arrayValue);
+    for (int idx : session->received)
+    {
+      received_json.append(idx);
+    }
+
+    Json::Value resp_json;
+    resp_json["code"] = 0;
+    resp_json["message"] = "query success";
+    resp_json["upload_id"] = uploadId;
+    resp_json["filename"] = session->filename;
+    resp_json["file_size"] = session->file_size;
+    resp_json["total_chunks"] = session->total_chunks;
+    resp_json["received_chunks"] = static_cast<int>(session->received.size());
+    resp_json["chunks"] = received_json;
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
+    callback(resp);
+  }
+
   // GET /api/files
   void handleListFiles(const HttpRequestPtr &req,
                        std::function<void(const HttpResponsePtr &)> &&callback)
@@ -520,6 +791,14 @@ int main(int argc, char *argv[])
 
   // 受保护路由
   app().registerHandler("/api/user/logout", &handleLogout, {Post});
+
+  // 分片上传路由（需在 /api/files/upload 之前注册，否则被泛匹配截获）
+  app().registerHandler("/api/files/upload/init", &handleChunkInit, {Post});
+  // 必须比 /{chunkIndex} 先注册，否则 complete/status 会被参数化路由吃掉
+  app().registerHandler("/api/files/upload/{uploadId}/complete", &handleChunkComplete, {Post});
+  app().registerHandler("/api/files/upload/{uploadId}/status", &handleChunkStatus, {Get});
+  app().registerHandler("/api/files/upload/{uploadId}/{chunkIndex}", &handleChunkUpload, {Post});
+
   app().registerHandler("/api/files/upload", &handleUpload, {Post});
   app().registerHandler("/api/files", &handleListFiles, {Get});
   app().registerHandler("/api/files/{fileId}", &handleDownload, {Get});
