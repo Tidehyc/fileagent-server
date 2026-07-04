@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "../common/CacheManager.h"
 #include "../db/ConnectionPool.h"
 #include "../db/MysqlConn.h"
 #include "../common/Logger.h"
@@ -43,6 +44,15 @@ namespace fileagent
 
     std::optional<SessionRecord> SessionDao::findByToken(const std::string &token)
     {
+        // 查缓存
+        auto &cache = CacheManager::instance().sessionCache();
+        auto cached = cache.get(token);
+        if (cached.has_value())
+        {
+            return cached;
+        }
+
+        // 未命中，查库
         auto connection = ConnectionPool::instance().getConnection();
         if (!connection)
         {
@@ -58,11 +68,19 @@ namespace fileagent
             return std::nullopt;
         }
 
-        return makeSessionRecord(connection);
+        auto session = makeSessionRecord(connection);
+
+        // 写入缓存
+        cache.put(session.session_token, session);
+
+        return session;
     }
 
     bool SessionDao::deleteByToken(const std::string &token)
     {
+        // 从缓存删除
+        CacheManager::instance().sessionCache().remove(token);
+
         auto connection = ConnectionPool::instance().getConnection();
         if (!connection)
         {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "../common/CacheManager.h"
 #include "../common/Logger.h"
 #include "../dao/FileDao.h"
 
@@ -96,6 +97,10 @@ namespace fileagent
             return ServiceResult<FileRecord>::fail("file created but cannot be reloaded");
         }
 
+        // 写入缓存
+        CacheManager::instance().fileCacheById().put(created_file->id, *created_file);
+        CacheManager::instance().fileCacheByHash().put(created_file->file_hash, *created_file);
+
         return ServiceResult<FileRecord>::ok(*created_file, "create file success");
     }
 
@@ -106,12 +111,24 @@ namespace fileagent
             return ServiceResult<FileRecord>::fail("file id is invalid");
         }
 
+        // 查缓存
+        auto &cache = CacheManager::instance().fileCacheById();
+        auto cached = cache.get(file_id);
+        if (cached.has_value())
+        {
+            return ServiceResult<FileRecord>::ok(*cached, "cache hit");
+        }
+
+        // 未命中，查库
         FileDao file_dao;
         auto file = file_dao.findById(file_id);
         if (!file.has_value())
         {
             return ServiceResult<FileRecord>::fail("file not found");
         }
+
+        // 写入缓存
+        cache.put(file->id, *file);
 
         return ServiceResult<FileRecord>::ok(*file, "query success");
     }
@@ -124,12 +141,24 @@ namespace fileagent
             return ServiceResult<FileRecord>::fail("file hash is empty");
         }
 
+        // 查缓存
+        auto &cache = CacheManager::instance().fileCacheByHash();
+        auto cached = cache.get(normalized_hash);
+        if (cached.has_value())
+        {
+            return ServiceResult<FileRecord>::ok(*cached, "cache hit");
+        }
+
+        // 未命中，查库
         FileDao file_dao;
         auto file = file_dao.findByHash(normalized_hash);
         if (!file.has_value())
         {
             return ServiceResult<FileRecord>::fail("file not found");
         }
+
+        // 写入缓存
+        cache.put(file->file_hash, *file);
 
         return ServiceResult<FileRecord>::ok(*file, "query success");
     }
@@ -177,6 +206,16 @@ namespace fileagent
         {
             return ServiceStatus::fail("file id is invalid");
         }
+
+        // 从缓存中查找（保留信息用于清理缓存键）
+        auto &id_cache = CacheManager::instance().fileCacheById();
+        auto cached = id_cache.get(file_id);
+        if (cached.has_value())
+        {
+            // 从哈希缓存也清除
+            CacheManager::instance().fileCacheByHash().remove(cached->file_hash);
+        }
+        id_cache.remove(file_id);
 
         FileDao file_dao;
         if (!file_dao.removeById(file_id))
