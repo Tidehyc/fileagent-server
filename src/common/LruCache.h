@@ -2,17 +2,22 @@
 
 #include <cstddef>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 
+#include "CacheInterface.h"
+
 namespace fileagent
 {
 
     /**
      * @brief 线程安全的 LRU (最近最少使用) 缓存
+     *
+     * 实现 CacheInterface<K, V> 接口。
      *
      * @tparam K 键类型
      * @tparam V 值类型
@@ -24,7 +29,7 @@ namespace fileagent
      *   - put/remove 使用独占锁（写）
      */
     template <typename K, typename V>
-    class LruCache
+    class LruCache : public CacheInterface<K, V>
     {
     public:
         using value_type = V;

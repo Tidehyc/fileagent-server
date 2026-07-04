@@ -52,6 +52,15 @@ endif()
 target_link_libraries(fileagent-server PRIVATE yaml-cpp::yaml-cpp)
 target_link_libraries(fileagent-server PRIVATE ${MYSQL_CLIENT_LIBRARY})
 target_link_libraries(fileagent-server PRIVATE crypt)
+find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+find_library(HIREDIS_LIBRARY NAMES hiredis)
+if(NOT HIREDIS_INCLUDE_DIR OR NOT HIREDIS_LIBRARY)
+    message(WARNING "hiredis not found; Redis cache support disabled")
+else()
+    target_include_directories(fileagent-server PRIVATE ${HIREDIS_INCLUDE_DIR})
+    target_link_libraries(fileagent-server PRIVATE ${HIREDIS_LIBRARY})
+    message(STATUS "hiredis found, Redis cache enabled")
+endif()
 
 target_compile_options(fileagent-server PRIVATE
     -Wall

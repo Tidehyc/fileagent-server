@@ -1,19 +1,21 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
+#include "CacheInterface.h"
 #include "Config.h"
-#include "LruCache.h"
 #include "../dao/Models.h"
 
 namespace fileagent
 {
 
+    class RedisClient;
+
     /**
      * @brief 缓存管理器单例
      *
-     * 持有多个 LRU 缓存实例，根据 CacheConfig 初始化。
-     * 当前仅支持 LRU 模式，后续可扩展 Redis。
+     * 根据 CacheConfig::type 运行时切换 LRU 内存缓存 / Redis 缓存。
      */
     class CacheManager
     {
@@ -25,31 +27,24 @@ namespace fileagent
          */
         void init(const CacheConfig &config);
 
-        /**
-         * @brief 是否已初始化
-         */
         bool initialized() const { return initialized_; }
 
-        /**
-         * @brief 获取文件记录缓存
-         */
-        LruCache<std::int64_t, FileRecord> &fileCacheById()
+        // 缓存类型
+        const std::string &type() const { return type_; }
+
+        // ─── 缓存访问接口 ─────────────────────────
+
+        CacheInterface<std::int64_t, FileRecord> &fileCacheById()
         {
             return *file_cache_by_id_;
         }
 
-        /**
-         * @brief 获取文件记录哈希缓存
-         */
-        LruCache<std::string, FileRecord> &fileCacheByHash()
+        CacheInterface<std::string, FileRecord> &fileCacheByHash()
         {
             return *file_cache_by_hash_;
         }
 
-        /**
-         * @brief 获取 session 缓存
-         */
-        LruCache<std::string, SessionRecord> &sessionCache()
+        CacheInterface<std::string, SessionRecord> &sessionCache()
         {
             return *session_cache_;
         }
@@ -61,10 +56,14 @@ namespace fileagent
         CacheManager() = default;
 
         bool initialized_{false};
+        std::string type_{"lru"};
 
-        std::unique_ptr<LruCache<std::int64_t, FileRecord>> file_cache_by_id_;
-        std::unique_ptr<LruCache<std::string, FileRecord>> file_cache_by_hash_;
-        std::unique_ptr<LruCache<std::string, SessionRecord>> session_cache_;
+        std::unique_ptr<CacheInterface<std::int64_t, FileRecord>> file_cache_by_id_;
+        std::unique_ptr<CacheInterface<std::string, FileRecord>> file_cache_by_hash_;
+        std::unique_ptr<CacheInterface<std::string, SessionRecord>> session_cache_;
+
+        // Redis 客户端（仅 Redis 模式使用）
+        std::unique_ptr<RedisClient> redis_client_;
     };
 
 } // namespace fileagent

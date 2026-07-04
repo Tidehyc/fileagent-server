@@ -37,7 +37,7 @@ C++20 AI 智能文件管理服务 — 基于 Drogon (epoll) + MySQL + llama.cpp
 |---|------|------|------|
 | 16 | Drogon 构建集成 | ⚠️ 依赖 | 需要 vcpkg 安装 Drogon，当前 `FILEAGENT_ENABLE_DROGON=OFF` 降级 stub |
 | 17 | LRU 缓存 | ✅ Done | 线程安全 LRU 缓存模板 + CacheManager 单例，集成到 FileService 和 SessionDao |
-| 18 | Redis 缓存 | ❌ **TODO** | 配置已定义，无实现 |
+| 18 | Redis 缓存 | ✅ Done | hiredis 客户端 + 三组 Redis 缓存实现，配置切换 + 自动降级 LRU |
 | 19 | 文件去重 | ❌ **TODO** | `FileService::createFile` 已按哈希去重逻辑，需配合上传完整实现 |
 | 20 | 大文件分片上传 | ❌ **TODO** | 需 `file_chunks` 表 + 合并逻辑 |
 | 21 | 分享链接 | ❌ **TODO** | 需 `shares` 表 + 过期/访问控制 |
