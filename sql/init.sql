@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
     password    VARCHAR(256)    NOT NULL                 COMMENT '密码（bcrypt 哈希）',
     email       VARCHAR(128)    NOT NULL                 COMMENT '邮箱',
     status      TINYINT         NOT NULL DEFAULT 1       COMMENT '状态: 1=正常, 0=禁用',
+    is_admin    TINYINT         NOT NULL DEFAULT 0       COMMENT '管理员: 1=是, 0=否',
     created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 

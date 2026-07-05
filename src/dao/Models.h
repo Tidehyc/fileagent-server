@@ -13,6 +13,7 @@ namespace fileagent
         std::string password;
         std::string email;
         int status{0};
+        bool is_admin{false};
         std::string created_at;
         std::string updated_at;
     };

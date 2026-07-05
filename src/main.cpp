@@ -19,6 +19,7 @@
 #include "dao/SessionDao.h"
 #include "dao/UserDao.h"
 #include "db/ConnectionPool.h"
+#include "db/MysqlConn.h"
 #include "server/AuthMiddleware.h"
 #include "service/AuthService.h"
 #include "service/ChunkUploadService.h"
@@ -937,6 +938,118 @@ namespace
     callback(resp);
   }
 
+  // ─── Admin ─────────────────────────────────────────
+
+  // 检查当前用户是否为 admin
+  bool requireAdmin(const HttpRequestPtr &req,
+                    std::function<void(const HttpResponsePtr &)> &callback)
+  {
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return false;
+
+    UserDao user_dao;
+    auto user = user_dao.findById(user_id);
+    if (!user.has_value() || !user->is_admin)
+    {
+      callback(makeJsonResponse(403, "admin access required"));
+      return false;
+    }
+    return true;
+  }
+
+  // GET /api/admin/users
+  void handleAdminUsers(const HttpRequestPtr &req,
+                        std::function<void(const HttpResponsePtr &)> &&callback)
+  {
+    if (!requireAdmin(req, callback)) return;
+
+    int limit = 20, offset = 0;
+    auto lp = req->getParameter("limit");
+    auto op = req->getParameter("offset");
+    if (!lp.empty()) limit = std::stoi(lp);
+    if (!op.empty()) offset = std::stoi(op);
+
+    UserDao user_dao;
+    auto users = user_dao.listAll(limit, offset);
+    auto total = user_dao.countAll();
+
+    Json::Value users_json(Json::arrayValue);
+    for (const auto &u : users)
+    {
+      Json::Value item;
+      item["id"] = u.id;
+      item["username"] = u.username;
+      item["email"] = u.email;
+      item["status"] = u.status;
+      item["is_admin"] = u.is_admin;
+      item["created_at"] = u.created_at;
+      users_json.append(item);
+    }
+
+    Json::Value resp_json;
+    resp_json["code"] = 0;
+    resp_json["users"] = users_json;
+    resp_json["total"] = static_cast<Json::Int64>(total);
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
+    callback(resp);
+  }
+
+  // PATCH /api/admin/users/{userId}/status
+  void handleAdminSetStatus(const HttpRequestPtr &req,
+                            std::function<void(const HttpResponsePtr &)> &&callback,
+                            const std::string &userIdStr)
+  {
+    if (!requireAdmin(req, callback)) return;
+
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
+
+    std::int64_t user_id = std::stoll(userIdStr);
+    int status = (*json)["status"].asInt();
+
+    UserDao user_dao;
+    if (!user_dao.updateStatus(user_id, status))
+    {
+      callback(makeJsonResponse(500, "failed to update status"));
+      return;
+    }
+    callback(makeJsonResponse(0, "status updated"));
+  }
+
+  // PATCH /api/admin/users/{userId}/admin
+  void handleAdminSetAdmin(const HttpRequestPtr &req,
+                           std::function<void(const HttpResponsePtr &)> &&callback,
+                           const std::string &userIdStr)
+  {
+    if (!requireAdmin(req, callback)) return;
+
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
+
+    std::int64_t user_id = std::stoll(userIdStr);
+    bool is_admin = (*json)["is_admin"].asBool();
+
+    // 直接执行 SQL 设置 is_admin
+    auto conn = ConnectionPool::instance().getConnection();
+    if (!conn)
+    {
+      callback(makeJsonResponse(500, "database error"));
+      return;
+    }
+    std::string sql = "UPDATE users SET is_admin = " + std::to_string(is_admin ? 1 : 0) +
+                      ", updated_at = NOW() WHERE id = " + std::to_string(user_id);
+    if (!conn->update(sql))
+    {
+      callback(makeJsonResponse(500, "failed to update admin status"));
+      return;
+    }
+    callback(makeJsonResponse(0, "admin status updated"));
+  }
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1042,6 +1155,11 @@ int main(int argc, char *argv[])
   // ─── LLM 路由 ──────────────────────────────────
   app().registerHandler("/api/llm/chat", &handleLlmChat, {Post});
   app().registerHandler("/api/llm/analyze", &handleLlmAnalyze, {Post});
+
+  // ─── Admin 路由 ─────────────────────────────────
+  app().registerHandler("/api/admin/users", &handleAdminUsers, {Get});
+  app().registerHandler("/api/admin/users/{userId}/status", &handleAdminSetStatus, {Patch});
+  app().registerHandler("/api/admin/users/{userId}/admin", &handleAdminSetAdmin, {Patch});
 
   // 启动
   app().addListener(app_config.server.host, app_config.server.port).setThreadNum(static_cast<unsigned int>(app_config.server.threads)).run();

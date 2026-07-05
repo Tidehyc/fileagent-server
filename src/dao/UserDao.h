@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "Models.h"
 
@@ -20,6 +21,9 @@ namespace fileagent
 
         bool updateStatus(std::int64_t id, int status);
         bool updatePassword(std::int64_t id, const std::string &password);
+
+        std::vector<UserRecord> listAll(int limit = 20, int offset = 0);
+        std::int64_t countAll();
     };
 
 } // namespace fileagent
