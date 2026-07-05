@@ -62,7 +62,10 @@ namespace fileagent
     // LLM 配置
     struct LlmConfig
     {
-        std::string model_path;
+        std::string provider = "ollama";     // "ollama" 或 "local"
+        std::string api_base;                 // Ollama 服务地址
+        std::string model = "llama3.2";       // Ollama 模型名
+        std::string model_path;               // 本地 GGUF 路径（provider=local 时使用）
         int num_threads = 4;
         int context_window = 2048;
     };

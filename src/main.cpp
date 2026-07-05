@@ -23,6 +23,7 @@
 #include "service/AuthService.h"
 #include "service/ChunkUploadService.h"
 #include "service/FileService.h"
+#include "service/LlmService.h"
 #include "service/ShareService.h"
 
 using namespace drogon;
@@ -831,6 +832,111 @@ namespace
     callback(resp);
   }
 
+  // ─── LLM ─────────────────────────────────────────
+
+  // 全局 LLM 服务实例（main 中初始化）
+  static std::unique_ptr<LlmService> g_llm_service;
+
+  // POST /api/llm/chat
+  void handleLlmChat(const HttpRequestPtr &req,
+                     std::function<void(const HttpResponsePtr &)> &&callback)
+  {
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
+
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
+
+    std::string prompt = (*json)["prompt"].asString();
+    if (prompt.empty())
+    {
+      callback(makeJsonResponse(400, "prompt is empty"));
+      return;
+    }
+
+    auto result = g_llm_service->chat(prompt);
+    if (!result.success)
+    {
+      callback(makeJsonResponse(500, result.message));
+      return;
+    }
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody("{\"code\":0,\"message\":\"success\",\"response\":\"" +
+                  jsonEscape(*result.data) + "\"}");
+    callback(resp);
+  }
+
+  // POST /api/llm/analyze
+  void handleLlmAnalyze(const HttpRequestPtr &req,
+                        std::function<void(const HttpResponsePtr &)> &&callback)
+  {
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
+
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
+
+    std::int64_t file_id = (*json)["file_id"].asInt64();
+    std::string instruction = (*json)["instruction"].asString();
+
+    if (file_id <= 0 || instruction.empty())
+    {
+      callback(makeJsonResponse(400, "file_id and instruction are required"));
+      return;
+    }
+
+    FileService file_service;
+    auto file = file_service.getFileById(file_id);
+    if (!file.success)
+    {
+      callback(makeJsonResponse(404, "file not found"));
+      return;
+    }
+
+    if (file.data->user_id != user_id)
+    {
+      callback(makeJsonResponse(403, "access denied"));
+      return;
+    }
+
+    // 读取文件文本内容
+    std::string file_content;
+    {
+      std::ifstream in(file.data->storage_path);
+      if (!in)
+      {
+        callback(makeJsonResponse(500, "failed to read file"));
+        return;
+      }
+      std::stringstream ss;
+      ss << in.rdbuf();
+      file_content = ss.str();
+    }
+
+    if (file_content.size() > 100000)
+    {
+      file_content.resize(100000);
+      file_content += "\n\n[内容已截断，仅分析前 100KB]";
+    }
+
+    auto result = g_llm_service->analyze(file_content, instruction);
+    if (!result.success)
+    {
+      callback(makeJsonResponse(500, result.message));
+      return;
+    }
+
+    auto resp = HttpResponse::newHttpResponse();
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody("{\"code\":0,\"message\":\"success\",\"analysis\":\"" +
+                  jsonEscape(*result.data) + "\"}");
+    callback(resp);
+  }
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -870,6 +976,12 @@ int main(int argc, char *argv[])
   }
 
   CacheManager::instance().init(app_config.cache);
+
+  // 初始化 LLM 服务
+  g_llm_service = std::make_unique<LlmService>();
+  g_llm_service->init(app_config.llm.provider,
+                      app_config.llm.api_base,
+                      app_config.llm.model);
 
   logInfo("Configuration loaded and validated");
   logDebug(app_config.toString());
@@ -925,6 +1037,10 @@ int main(int argc, char *argv[])
   app().registerHandler("/api/shares", &handleShareCreate, {Post});
   app().registerHandler("/api/shares", &handleShareList, {Get});
   app().registerHandler("/api/shares/{token}", &handleShareDelete, {Delete});
+
+  // ─── LLM 路由 ──────────────────────────────────
+  app().registerHandler("/api/llm/chat", &handleLlmChat, {Post});
+  app().registerHandler("/api/llm/analyze", &handleLlmAnalyze, {Post});
 
   // 启动
   app().addListener(app_config.server.host, app_config.server.port).setThreadNum(static_cast<unsigned int>(app_config.server.threads)).run();

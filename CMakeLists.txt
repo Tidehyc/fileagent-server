@@ -39,10 +39,22 @@ file(GLOB_RECURSE SOURCES
 
 add_executable(fileagent-server ${SOURCES})
 
+set(AGENTS_CPP_DIR $ENV{HOME}/workplace/agents.cpp-main)
+
 target_include_directories(fileagent-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${MYSQL_INCLUDE_DIR}
+    ${AGENTS_CPP_DIR}/include
 )
+
+# Link agents-cpp precompiled library
+if(EXISTS ${AGENTS_CPP_DIR}/lib/linux/x64/libagents_cpp_shared_lib.so)
+    target_link_libraries(fileagent-server PRIVATE
+        ${AGENTS_CPP_DIR}/lib/linux/x64/libagents_cpp_shared_lib.so)
+    message(STATUS "Found agents-cpp shared library")
+else()
+    message(WARNING "agents-cpp shared library not found; LLM features disabled")
+endif()
 
 if(FILEAGENT_ENABLE_DROGON)
     target_compile_definitions(fileagent-server PRIVATE FILEAGENT_ENABLE_DROGON=1)

@@ -28,6 +28,9 @@ cache:
     capacity: 10000
 
 llm:
-  model_path: "/models/llama-2-7b.Q4_K_M.gguf"
+  provider: "ollama"           # "ollama" 或 "local"
+  api_base: "http://localhost:11434/api"
+  model: "llama3.2"            # Ollama 模型名
+  model_path: "/models/llama-2-7b.Q4_K_M.gguf"  # 本地 GGUF 路径（provider=local 时使用）
   num_threads: 4
   context_window: 2048

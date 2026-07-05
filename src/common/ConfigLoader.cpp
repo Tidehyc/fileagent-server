@@ -74,6 +74,9 @@ namespace fileagent
             if (config["llm"])
             {
                 YAML::Node llm_cfg = config["llm"];
+                llm.provider = llm_cfg["provider"].as<std::string>(llm.provider);
+                llm.api_base = llm_cfg["api_base"].as<std::string>(llm.api_base);
+                llm.model = llm_cfg["model"].as<std::string>(llm.model);
                 llm.model_path = llm_cfg["model_path"].as<std::string>("");
                 llm.num_threads = llm_cfg["num_threads"].as<int>(llm.num_threads);
                 llm.context_window = llm_cfg["context_window"].as<int>(llm.context_window);
@@ -162,7 +165,8 @@ namespace fileagent
         }
 
         ss << "\n"
-           << "  LLM: model_path=" << llm.model_path << "\n"
+           << "  LLM: provider=" << llm.provider << ", model=" << llm.model
+           << ", api_base=" << llm.api_base << ", model_path=" << llm.model_path << "\n"
            << "}";
 
         return ss.str();
