@@ -1,35 +1,12 @@
 #include "FileService.h"
 
-#include <algorithm>
-#include <cctype>
-
 #include "../common/CacheManager.h"
 #include "../common/Logger.h"
+#include "../common/StringUtil.h"
 #include "../dao/FileDao.h"
 
 namespace fileagent
 {
-
-    namespace
-    {
-
-        std::string trimCopy(std::string value)
-        {
-            auto is_space = [](unsigned char ch)
-            {
-                return std::isspace(ch) != 0;
-            };
-
-            value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](unsigned char ch)
-                                                    { return !is_space(ch); }));
-            value.erase(std::find_if(value.rbegin(), value.rend(), [&](unsigned char ch)
-                                     { return !is_space(ch); })
-                            .base(),
-                        value.end());
-            return value;
-        }
-
-    } // namespace
 
     bool FileService::validateRecord(const FileRecord &record, std::string &message) const
     {

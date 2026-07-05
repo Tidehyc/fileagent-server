@@ -69,24 +69,30 @@ namespace
     return resp;
   }
 
-  HttpResponsePtr makeJsonResponse(int code, const std::string &message, const std::string &data_field, const std::string &data_value)
-  {
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":" + std::to_string(code) + ",\"message\":\"" + message + "\",\"" + data_field + "\":\"" + data_value + "\"}");
-    return resp;
-  }
-
   // ─── 路由处理器 ──────────────────────────────────
 
   // GET /health
   void handleHealth(const HttpRequestPtr &,
                     std::function<void(const HttpResponsePtr &)> &&callback)
   {
+    Json::Value json;
+    json["status"] = "ok";
+
+    // 数据库状态
+    auto &pool = ConnectionPool::instance();
+    json["database"]["available"] = static_cast<Json::Int64>(pool.available());
+    json["database"]["active"] = static_cast<Json::Int64>(pool.active());
+    json["database"]["status"] = (pool.available() > 0 || pool.active() > 0) ? "connected" : "disconnected";
+
+    // 缓存状态
+    auto &cm = CacheManager::instance();
+    json["cache"]["type"] = cm.type();
+    json["cache"]["initialized"] = cm.initialized();
+
     auto resp = HttpResponse::newHttpResponse();
-    resp->setBody("ok");
-    resp->setContentTypeCode(CT_TEXT_PLAIN);
+    resp->setStatusCode(k200OK);
+    resp->setContentTypeCode(CT_APPLICATION_JSON);
+    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), json));
     callback(resp);
   }
 
@@ -759,7 +765,7 @@ namespace
   }
 
   // GET /api/shares/{token}  (public)
-  void handleShareAccess(const HttpRequestPtr &req,
+  void handleShareAccess(const HttpRequestPtr & /*req*/,
                          std::function<void(const HttpResponsePtr &)> &&callback,
                          const std::string &token)
   {
