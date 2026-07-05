@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
+#include <sstream>
 #include <string>
 
 namespace fileagent
@@ -24,6 +26,43 @@ namespace fileagent
                         .base(),
                     value.end());
         return value;
+    }
+
+    /**
+     * @brief JSON 字符串转义
+     *
+     * 将字符串中的特殊字符转义为 JSON 兼容的格式：
+     *   " → \"    \ → \\    \n → \\n    \r → \\r
+     *   \t → \\t  \b → \\b  \f → \\f  控制字符 → \\uXXXX
+     */
+    inline std::string jsonEscape(const std::string &raw)
+    {
+        std::ostringstream oss;
+        for (unsigned char ch : raw)
+        {
+            switch (ch)
+            {
+            case '"':  oss << "\\\""; break;
+            case '\\': oss << "\\\\"; break;
+            case '\b': oss << "\\b";  break;
+            case '\f': oss << "\\f";  break;
+            case '\n': oss << "\\n";  break;
+            case '\r': oss << "\\r";  break;
+            case '\t': oss << "\\t";  break;
+            default:
+                if (ch < 0x20)
+                {
+                    oss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(ch);
+                }
+                else
+                {
+                    oss << ch;
+                }
+                break;
+            }
+        }
+        return oss.str();
     }
 
 } // namespace fileagent

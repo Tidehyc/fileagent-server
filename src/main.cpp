@@ -12,6 +12,7 @@
 #include "common/ConfigLoader.h"
 #include "common/Hash.h"
 #include "common/Logger.h"
+#include "common/StringUtil.h"
 #include "common/Types.h"
 #include "dao/FileDao.h"
 #include "dao/ShareDao.h"
@@ -59,14 +60,42 @@ namespace
     return authenticateRequest(req);
   }
 
-  // 创建 JSON 响应
+  // 创建 JSON 响应（message 自动转义）
   HttpResponsePtr makeJsonResponse(int code, const std::string &message)
   {
     auto resp = HttpResponse::newHttpResponse();
     resp->setStatusCode(k200OK);
     resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":" + std::to_string(code) + ",\"message\":\"" + message + "\"}");
+    resp->setBody("{\"code\":" + std::to_string(code) + ",\"message\":\"" + jsonEscape(message) + "\"}");
     return resp;
+  }
+
+  // 认证检查：失败时自动发送 401 并返回 0
+  std::int64_t requireAuth(const HttpRequestPtr &req,
+                           std::function<void(const HttpResponsePtr &)> &callback)
+  {
+    std::int64_t user_id = getUserIdFromRequest(req);
+    if (user_id == 0)
+    {
+      callback(makeJsonResponse(401, "unauthorized"));
+    }
+    return user_id;
+  }
+
+  // JSON 请求体验证：失败时自动发送 400 并返回 nullptr
+  const Json::Value *requireJsonBody(const HttpRequestPtr &req,
+                                     std::function<void(const HttpResponsePtr &)> &callback)
+  {
+    auto json_obj = req->getJsonObject();
+    if (!json_obj)
+    {
+      callback(makeJsonResponse(400, "request body must be JSON"));
+      return nullptr;
+    }
+    // 将 shared_ptr 内容移到静态缓存（避免悬空指针）
+    static thread_local Json::Value cached_json;
+    cached_json = *json_obj;
+    return &cached_json;
   }
 
   // ─── 路由处理器 ──────────────────────────────────
@@ -100,12 +129,8 @@ namespace
   void handleRegister(const HttpRequestPtr &req,
                       std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    auto json = req->getJsonObject();
-    if (!json)
-    {
-      callback(makeJsonResponse(400, "request body must be JSON"));
-      return;
-    }
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
 
     RegisterRequest reg_req{
         (*json)["username"].asString(),
@@ -128,12 +153,8 @@ namespace
   void handleLogin(const HttpRequestPtr &req,
                    std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    auto json = req->getJsonObject();
-    if (!json)
-    {
-      callback(makeJsonResponse(400, "request body must be JSON"));
-      return;
-    }
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
 
     LoginRequest login_req{
         (*json)["username"].asString(),
@@ -182,12 +203,8 @@ namespace
   void handleLogout(const HttpRequestPtr &req,
                     std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     const auto &auth_header = req->getHeader("Authorization");
     std::string token = auth_header.substr(7); // 跳过 "Bearer "
@@ -202,12 +219,8 @@ namespace
   void handleUpload(const HttpRequestPtr &req,
                     std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     // 解析 multipart 请求
     MultiPartParser parser;
@@ -308,19 +321,11 @@ namespace
   void handleChunkInit(const HttpRequestPtr &req,
                        std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
-    auto json = req->getJsonObject();
-    if (!json)
-    {
-      callback(makeJsonResponse(400, "request body must be JSON"));
-      return;
-    }
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
 
     std::string filename = (*json)["filename"].asString();
     std::int64_t file_size = (*json)["file_size"].asInt64();
@@ -349,12 +354,8 @@ namespace
                          const std::string &uploadId,
                          const std::string &chunkIndexStr)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     auto session = ChunkUploadManager::instance().getSession(uploadId);
     if (!session || session->user_id != user_id)
@@ -411,12 +412,8 @@ namespace
                            std::function<void(const HttpResponsePtr &)> &&callback,
                            const std::string &uploadId)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     auto session = ChunkUploadManager::instance().getSession(uploadId);
     if (!session || session->user_id != user_id)
@@ -534,12 +531,8 @@ namespace
                          std::function<void(const HttpResponsePtr &)> &&callback,
                          const std::string &uploadId)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     auto session = ChunkUploadManager::instance().getSession(uploadId);
     if (!session || session->user_id != user_id)
@@ -576,12 +569,8 @@ namespace
   void handleListFiles(const HttpRequestPtr &req,
                        std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     // 解析分页参数
     int limit = 20;
@@ -633,12 +622,8 @@ namespace
                       std::function<void(const HttpResponsePtr &)> &&callback,
                       const std::string &fileId_str)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     std::int64_t file_id = std::stoll(fileId_str);
     FileService file_service;
@@ -677,12 +662,8 @@ namespace
                     std::function<void(const HttpResponsePtr &)> &&callback,
                     const std::string &fileId_str)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     std::int64_t file_id = std::stoll(fileId_str);
 
@@ -731,19 +712,11 @@ namespace
   void handleShareCreate(const HttpRequestPtr &req,
                          std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
-    auto json = req->getJsonObject();
-    if (!json)
-    {
-      callback(makeJsonResponse(400, "request body must be JSON"));
-      return;
-    }
+    const Json::Value *json = requireJsonBody(req, callback);
+    if (!json) return;
 
     std::int64_t file_id = (*json)["file_id"].asInt64();
     int expire_hours = (*json)["expire_hours"].asInt();
@@ -802,12 +775,8 @@ namespace
                          std::function<void(const HttpResponsePtr &)> &&callback,
                          const std::string &token)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     ShareDao share_dao;
     auto share = share_dao.findByToken(token);
@@ -830,12 +799,8 @@ namespace
   void handleShareList(const HttpRequestPtr &req,
                        std::function<void(const HttpResponsePtr &)> &&callback)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
-    if (user_id == 0)
-    {
-      callback(makeJsonResponse(401, "unauthorized"));
-      return;
-    }
+    std::int64_t user_id = requireAuth(req, callback);
+    if (user_id == 0) return;
 
     ShareDao share_dao;
     auto shares = share_dao.listByUserId(user_id);
