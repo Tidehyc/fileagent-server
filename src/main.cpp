@@ -980,6 +980,7 @@ int main(int argc, char *argv[])
   // 初始化 LLM 服务
   g_llm_service = std::make_unique<LlmService>();
   g_llm_service->init(app_config.llm.provider,
+                      app_config.llm.api_key,
                       app_config.llm.api_base,
                       app_config.llm.model);
 

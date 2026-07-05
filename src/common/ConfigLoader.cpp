@@ -75,6 +75,7 @@ namespace fileagent
             {
                 YAML::Node llm_cfg = config["llm"];
                 llm.provider = llm_cfg["provider"].as<std::string>(llm.provider);
+                llm.api_key = llm_cfg["api_key"].as<std::string>(llm.api_key);
                 llm.api_base = llm_cfg["api_base"].as<std::string>(llm.api_base);
                 llm.model = llm_cfg["model"].as<std::string>(llm.model);
                 llm.model_path = llm_cfg["model_path"].as<std::string>("");

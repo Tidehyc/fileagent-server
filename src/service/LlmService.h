@@ -22,11 +22,13 @@ namespace fileagent
 
         /**
          * @brief 初始化 LLM 后端
-         * @param provider   "ollama" 或 "local"
-         * @param api_base   Ollama 服务地址
+         * @param provider   "ollama"/"openai"/"anthropic"/"google"/"local"
+         * @param api_key    API Key（云服务需要）
+         * @param api_base   自定义 API 地址（可选）
          * @param model      模型名称
          */
         void init(const std::string &provider,
+                  const std::string &api_key,
                   const std::string &api_base,
                   const std::string &model);
 
@@ -54,6 +56,7 @@ namespace fileagent
     private:
         bool initialized_{false};
         std::string provider_;
+        std::string api_key_;
         std::string api_base_;
         std::string model_;
 

@@ -1,6 +1,6 @@
 #include "LlmService.h"
 
-#include <agents-cpp/llms/ollama_llm.h>
+#include <agents-cpp/llm_interface.h>
 
 #include "../common/Logger.h"
 
@@ -11,15 +11,35 @@ namespace fileagent
     class LlmService::Impl
     {
     public:
-        void init(const std::string &api_base, const std::string &model)
+        void init(const std::string &provider,
+                  const std::string &api_key,
+                  const std::string &api_base,
+                  const std::string &model)
         {
-            llm_ = std::make_unique<agents::llms::OllamaLLM>("", model);
-            llm_->setApiBase(api_base);
+            // 使用 agents-cpp 工厂函数创建对应 provider 的 LLM 实例
+            llm_ = agents::createLLM(provider, api_key, model);
 
+            if (!llm_)
+            {
+                logError("LlmService: failed to create LLM for provider=" + provider);
+                return;
+            }
+
+            // 设置自定义 API 地址（Ollama 或自定义代理）
+            if (!api_base.empty())
+            {
+                llm_->setApiBase(api_base);
+            }
+
+            // 设置参数
             agents::LLMOptions opts;
             opts.temperature = 0.7;
             opts.max_tokens = 2048;
             llm_->setOptions(opts);
+
+            logInfo("LlmService: initialized provider=" + provider +
+                    " model=" + model +
+                    (api_base.empty() ? "" : " api_base=" + api_base));
         }
 
         ServiceResult<std::string> chat(const std::string &prompt)
@@ -67,7 +87,7 @@ namespace fileagent
         }
 
     private:
-        std::unique_ptr<agents::llms::OllamaLLM> llm_;
+        std::shared_ptr<agents::LLMInterface> llm_;
     };
 
     // ─── LlmService 公开方法 ─────────────────────
@@ -76,25 +96,18 @@ namespace fileagent
     LlmService::~LlmService() = default;
 
     void LlmService::init(const std::string &provider,
+                           const std::string &api_key,
                            const std::string &api_base,
                            const std::string &model)
     {
         provider_ = provider;
+        api_key_ = api_key;
         api_base_ = api_base;
         model_ = model;
 
-        if (provider_ == "ollama")
-        {
-            impl_ = std::make_unique<Impl>();
-            impl_->init(api_base_, model_);
-            initialized_ = true;
-            logInfo("LlmService: initialized with provider=" + provider_ +
-                    " api_base=" + api_base_ + " model=" + model_);
-        }
-        else
-        {
-            logWarn("LlmService: provider '" + provider_ + "' not yet supported");
-        }
+        impl_ = std::make_unique<Impl>();
+        impl_->init(provider_, api_key_, api_base_, model_);
+        initialized_ = true;
     }
 
     ServiceResult<std::string> LlmService::chat(const std::string &prompt)
