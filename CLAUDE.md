@@ -47,7 +47,7 @@ C++20 AI 智能文件管理服务 — 基于 Drogon (epoll) + MySQL + llama.cpp
 
 | # | 需求 | 状态 | 说明 |
 |---|------|------|------|
-| 23 | LLM 集成 (llama.cpp) | ❌ **TODO** | 配置文件有 `model_path` / `num_threads` / `context_window`，无实现 |
+| 23 | LLM 集成 (llama.cpp/Ollama) | ✅ Done | 复用 agents.cpp-main 的 createLLM() 工厂，支持 ollama/openai/anthropic/google 四种 provider |
 | 24 | 智能文件分析（LLM 驱动态） | ❌ **TODO** | 基于 LLM 的文件内容摘要/标签/分类 |
 | 25 | 全文搜索 | ❌ **TODO** | 文件名 + 内容索引 |
 | 26 | 单元测试 | ❌ **TODO** | 无测试框架，无测试用例 |
@@ -105,18 +105,17 @@ HTTP API ██████████████████ 100%
 - Drogon 集成、LRU/Redis 缓存、文件去重、分片上传、分享链接
 - 代码质量清理：trimCopy 去重、JSON 转义、健康检查增强、认证代码抽取
 
-#### 待推进（按优先级排序）
+#### 待推进
 
 | # | 需求 | 优先级 | 说明 |
 |---|------|--------|------|
-| 1 | LLM 集成 (llama.cpp) | **高** | 最核心的差异化功能，配置文件已就绪，需实现模型加载与推理 |
-| 2 | Docker 容器化 | **高** | Dockerfile + docker-compose，MySQL + 服务一键部署 |
-| 3 | 用户状态管理 API | **中** | Admin 接口：禁用/启用用户 |
-| 4 | 单元测试 | **中** | Google Test 框架，DAO/Service 层测试 |
-| 5 | Rate limiting / API 安全 | **中** | 防暴力破解 / DoS 防护 |
-| 6 | Prepared Statement 迁移 | **低** | `escape()` → 参数化查询 |
-| 7 | 全文搜索 | **低** | 文件名 + 内容索引 |
-| 8 | 智能文件分析（LLM 驱动态） | **低** | 基于 LLM 的摘要/标签/分类 |
+| 1 | Docker 容器化 | **高** | Dockerfile + docker-compose，MySQL + 服务一键部署 |
+| 2 | 用户状态管理 API | **中** | Admin 接口：禁用/启用用户 |
+| 3 | 单元测试 | **中** | Google Test 框架，DAO/Service 层测试 |
+| 4 | Rate limiting / API 安全 | **中** | 防暴力破解 / DoS 防护 |
+| 5 | Prepared Statement 迁移 | **低** | `escape()` → 参数化查询 |
+| 6 | 全文搜索 | **低** | 文件名 + 内容索引 |
+| 7 | 智能文件分析（LLM 驱动态） | **低** | 基于 LLM 的摘要/标签/分类 |
 
 ---
 
