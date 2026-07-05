@@ -35,12 +35,12 @@ C++20 AI 智能文件管理服务 — 基于 Drogon (epoll) + MySQL + llama.cpp
 
 | # | 需求 | 状态 | 说明 |
 |---|------|------|------|
-| 16 | Drogon 构建集成 | ⚠️ 依赖 | 需要 vcpkg 安装 Drogon，当前 `FILEAGENT_ENABLE_DROGON=OFF` 降级 stub |
+| 16 | Drogon 构建集成 | ✅ Done | vcpkg 已安装 Drogon，`FILEAGENT_ENABLE_DROGON=ON` 已启用 |
 | 17 | LRU 缓存 | ✅ Done | 线程安全 LRU 缓存模板 + CacheManager 单例，集成到 FileService 和 SessionDao |
 | 18 | Redis 缓存 | ✅ Done | hiredis 客户端 + 三组 Redis 缓存实现，配置切换 + 自动降级 LRU |
-| 19 | 文件去重 | ❌ **TODO** | `FileService::createFile` 已按哈希去重逻辑，需配合上传完整实现 |
-| 20 | 大文件分片上传 | ❌ **TODO** | 需 `file_chunks` 表 + 合并逻辑 |
-| 21 | 分享链接 | ❌ **TODO** | 需 `shares` 表 + 过期/访问控制 |
+| 19 | 文件去重 | ✅ Done | 上传 API 自动 SHA-256 去重，重复文件返回已有记录 |
+| 20 | 大文件分片上传 | ✅ Done | ChunkUploadService + API: init/upload/complete/status |
+| 21 | 分享链接 | ✅ Done | ShareDao + ShareService + API: create/access/list/delete，支持过期 |
 | 22 | 用户状态管理 | ✅ Partial | `UserDao::updateStatus` 已实现，需 API 和 admin 接口 |
 
 #### P2 — 增强功能
@@ -54,7 +54,7 @@ C++20 AI 智能文件管理服务 — 基于 Drogon (epoll) + MySQL + llama.cpp
 | 27 | Docker 容器化 | ❌ **TODO** | Dockerfile + docker-compose |
 | 28 | Rate limiting / API 安全 | ❌ **TODO** | 防暴力破解 / Dos 防护 |
 | 29 | Prepared Statement 迁移 | ❌ **TODO** | 当前用 `escape()` 拼接 SQL，应改为参数化查询 |
-| 30 | 健康检查增强 | ✅ Partial | 仅 `/health` 返回 "ok"，需增加数据库/缓存探活 |
+| 30 | 健康检查增强 | ✅ Done | `/health` 返回 JSON：database(available/active/status) + cache(type/initialized) |
 
 ---
 
@@ -92,37 +92,31 @@ HTTP API ██████████████████ 100%
   ├─ GET  /api/files          ████████████ 100%
   ├─ GET  /api/files/{id}     ████████████ 100%
   ├─ DELETE /api/files/{id}   ████████████ 100%
-  └─ GET  /health             ████████████ 100%
+  ├─ GET  /health             ████████████ 100%
+  ├── 分片上传 4 个路由        ████████████ 100%
+  ├── 分享链接 4 个路由        ████████████ 100%
+  └─ 缓存层 LRU/Redis         ████████████ 100%
 ```
 
 ### 关键待办（按优先级排序）
 
-#### P0 已全部完成 ✅
-- 建表 DDL、密码哈希 (bcrypt)、Session 认证、全部 8 个 HTTP API 路由
+#### P0-P1 已全部完成 ✅
+- 建表 DDL、密码哈希 (bcrypt)、Session 认证、全部 HTTP API 路由
+- Drogon 集成、LRU/Redis 缓存、文件去重、分片上传、分享链接
+- 代码质量清理：trimCopy 去重、JSON 转义、健康检查增强、认证代码抽取
 
-#### P1 待推进
+#### 待推进（按优先级排序）
 
 | # | 需求 | 优先级 | 说明 |
 |---|------|--------|------|
-| 1 | 缓存实现 | **高** | LRU 缓存（第一优先），Redis 实现（后续） |
-| 2 | 文件去重优化 | **高** | 当前已按哈希去重，需完善上传体验 |
-| 3 | 大文件分片上传 | **中** | 需 `file_chunks` 表 + 合并逻辑 | 
-| 4 | 分享链接 | **中** | 需 `shares` 表 + 过期/访问控制 |
-| 5 | 用户状态管理 API | **中** | `updateStatus` 已实现，缺 admin 接口 |
-
-#### P2 待推进
-
-| # | 需求 | 说明 |
-|---|------|------|
-| 1 | LLM 集成 (llama.cpp) | 配置文件已就绪，无实现 |
-| 2 | 智能文件分析 | LLM 驱动态摘要/标签/分类 |
-| 3 | 全文搜索 | 文件名 + 内容索引 |
-| 4 | 单元测试 | 无测试框架，无测试用例 |
-| 5 | Docker 容器化 | Dockerfile + docker-compose |
-| 6 | Rate limiting / API 安全 | 防暴力破解 / DoS 防护 |
-| 7 | Prepared Statement 迁移 | `escape()` → 参数化查询 |
-| 8 | 健康检查增强 | 增加数据库/缓存探活 |
-| 9 | `trimCopy` 去重 | AuthService/FileService 中重复定义，需抽离到公共工具 |
+| 1 | LLM 集成 (llama.cpp) | **高** | 最核心的差异化功能，配置文件已就绪，需实现模型加载与推理 |
+| 2 | Docker 容器化 | **高** | Dockerfile + docker-compose，MySQL + 服务一键部署 |
+| 3 | 用户状态管理 API | **中** | Admin 接口：禁用/启用用户 |
+| 4 | 单元测试 | **中** | Google Test 框架，DAO/Service 层测试 |
+| 5 | Rate limiting / API 安全 | **中** | 防暴力破解 / DoS 防护 |
+| 6 | Prepared Statement 迁移 | **低** | `escape()` → 参数化查询 |
+| 7 | 全文搜索 | **低** | 文件名 + 内容索引 |
+| 8 | 智能文件分析（LLM 驱动态） | **低** | 基于 LLM 的摘要/标签/分类 |
 
 ---
 
@@ -142,6 +136,16 @@ config.yaml → AppConfig → ConnectionPool.init()
          ├── GET  /api/files/{id}    → FileService.getFileById + stream
          ├── DELETE /api/files/{id}  → FileService.removeFile + 磁盘清理
          │
+         ├── POST /api/files/upload/init       \ 分片上传
+         ├── POST /api/files/upload/{id}/{idx}  ├ ChunkUploadManager
+         ├── POST /api/files/upload/{id}/complete  /
+         ├── GET  /api/files/upload/{id}/status /
+         │
+         ├── POST /api/shares       \ 分享链接
+         ├── GET  /api/shares/{token} ├ ShareService + ShareDao
+         ├── DELETE /api/shares/{token}/
+         └── GET  /api/shares       /
+         │
          └── GET  /health           (public)
 ```
 
@@ -160,19 +164,27 @@ config.yaml → AppConfig → ConnectionPool.init()
 │   │   ├── ConfigLoader.cpp YAML 解析 + 校验 + toString
 │   │   ├── Hash.h/cpp      bcrypt 密码哈希 + 安全令牌生成
 │   │   ├── Logger.h        内联日志函数 (INFO/ERROR/WARN/DEBUG)
+│   │   ├── StringUtil.h    字符串工具（trimCopy / jsonEscape）
+│   │   ├── CacheInterface.h 缓存抽象接口
+│   │   ├── CacheManager.h/cpp 缓存管理器（LRU/Redis 切换）
+│   │   ├── LruCache.h      线程安全 LRU 缓存模板
+│   │   ├── RedisCache.h/cpp Redis 客户端 + 三组缓存实现
 │   │   └── Types.h         ApiResponse 基础类型
 │   ├── db/
 │   │   ├── MysqlConn.h/cpp MySQL C API 封装（连接/查询/事务/转义/存活追踪）
 │   │   └── ConnectionPool.h/cpp 线程安全连接池（生产者/回收者/RAII 守卫）
 │   ├── dao/
-│   │   ├── Models.h        UserRecord / FileRecord / SessionRecord 数据模型
+│   │   ├── Models.h        UserRecord / SessionRecord / ShareRecord / FileRecord
 │   │   ├── UserDao.h/cpp   用户数据访问
 │   │   ├── FileDao.h/cpp   文件数据访问
-│   │   └── SessionDao.h/cpp 会话数据访问
+│   │   ├── SessionDao.h/cpp 会话数据访问
+│   │   └── ShareDao.h/cpp  分享链接数据访问
 │   ├── service/
-│   │   ├── AuthService.h/cpp   用户注册/登录/状态管理
-│   │   ├── FileService.h/cpp   文件 CRUD 业务逻辑
-│   │   └── ServiceTypes.h      通用返回类型 (ServiceStatus/Result/ListResult)
+│   │   ├── AuthService.h/cpp       用户注册/登录/状态管理
+│   │   ├── FileService.h/cpp       文件 CRUD 业务逻辑
+│   │   ├── ChunkUploadService.h/cpp 分片上传会话管理
+│   │   ├── ShareService.h/cpp      分享链接业务逻辑
+│   │   └── ServiceTypes.h          通用返回类型 (ServiceStatus/Result/ListResult)
 │   └── server/
 │       └── HttpServer.h    Drogon 框架头文件引用 + 说明
 └── uploads/                文件存储根目录
@@ -205,7 +217,9 @@ config.yaml → AppConfig → ConnectionPool.init()
 - 文件命名: PascalCase（`ConnectionPool.h`）
 
 ### 代码质量注意
-- `trimCopy` 在 `AuthService.cpp` 和 `FileService.cpp` 中有重复定义，需抽取公共工具函数
+- ✅ `trimCopy` 已抽取到 `src/common/StringUtil.h`（含 `jsonEscape` 工具函数）
+- ✅ 认证/验证代码已抽取为 `requireAuth` / `requireJsonBody` 辅助函数
+- ✅ `makeJsonResponse` 已使用 `jsonEscape` 防止 JSON 注入
 - SQL 使用 `escape()` 防注入，后续应迁移到 prepared statement
 - 当前无异常安全保证（`ConfigLoader.cpp` 的 `try-catch` 除外），连接池的 `shutdown()` 是唯一清理入口
 - 所有 DAO 方法都从连接池取连接，没有事务协调能力——需要引入跨 DAO 事务支持
