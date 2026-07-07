@@ -35,11 +35,15 @@ CREATE TABLE IF NOT EXISTS files (
     file_size       BIGINT          NOT NULL DEFAULT 0       COMMENT '文件大小（字节）',
     storage_path    VARCHAR(512)    NOT NULL                 COMMENT '存储路径',
     status          TINYINT         NOT NULL DEFAULT 1       COMMENT '状态: 1=正常, 0=删除',
+    summary         TEXT                                     COMMENT 'AI 生成的文件摘要',
+    tags            VARCHAR(512)                             COMMENT 'AI 生成的标签（逗号分隔）',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
 
     PRIMARY KEY (id),
     KEY idx_user_id (user_id),
     KEY idx_file_hash (file_hash),
+    FULLTEXT idx_ft_summary (summary),
+    FULLTEXT idx_ft_tags (tags),
     CONSTRAINT fk_files_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='文件表';
 
@@ -95,3 +99,25 @@ CREATE TABLE IF NOT EXISTS sessions (
     KEY idx_expires_at (expires_at),
     CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会话（Session）表';
+
+-- ──────────────────────────────────────────────
+-- 搜索日志表
+-- ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS search_logs (
+    id              BIGINT          NOT NULL AUTO_INCREMENT  COMMENT '日志ID',
+    user_id         BIGINT          NOT NULL                 COMMENT '用户ID',
+    query           TEXT            NOT NULL                 COMMENT '搜索关键词',
+    result_count    INT             NOT NULL DEFAULT 0       COMMENT '结果数',
+    created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '搜索时间',
+
+    PRIMARY KEY (id),
+    KEY idx_user_id (user_id),
+    KEY idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='搜索日志表';
+
+-- ──────────────────────────────────────────────
+-- 数据库迁移（已有数据库升级用）
+-- ──────────────────────────────────────────────
+-- 如果是从旧版升级，取消注释以下语句：
+-- ALTER TABLE files ADD COLUMN summary TEXT COMMENT 'AI 生成的文件摘要' AFTER status;
+-- ALTER TABLE files ADD COLUMN tags VARCHAR(512) COMMENT 'AI 生成的标签' AFTER summary;

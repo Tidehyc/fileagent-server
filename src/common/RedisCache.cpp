@@ -122,6 +122,53 @@ namespace fileagent
         return ok;
     }
 
+    bool RedisClient::zincrby(const std::string &key, const std::string &member, double increment)
+    {
+        if (!isConnected())
+            return false;
+
+        redisReply *reply = static_cast<redisReply *>(
+            redisCommand(context_, "ZINCRBY %s %f %s", key.c_str(), increment, member.c_str()));
+
+        if (reply == nullptr)
+            return false;
+
+        bool ok = (reply->type == REDIS_REPLY_STRING);
+        freeReplyObject(reply);
+        return ok;
+    }
+
+    std::vector<std::pair<std::string, double>> RedisClient::zrevrange(const std::string &key, int start, int stop)
+    {
+        std::vector<std::pair<std::string, double>> result;
+
+        if (!isConnected())
+            return result;
+
+        redisReply *reply = static_cast<redisReply *>(
+            redisCommand(context_, "ZREVRANGE %s %d %d WITHSCORES", key.c_str(), start, stop));
+
+        if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY)
+        {
+            if (reply) freeReplyObject(reply);
+            return result;
+        }
+
+        for (size_t i = 0; i + 1 < reply->elements; i += 2)
+        {
+            if (reply->element[i]->type == REDIS_REPLY_STRING &&
+                reply->element[i + 1]->type == REDIS_REPLY_STRING)
+            {
+                std::string member(reply->element[i]->str, reply->element[i]->len);
+                double score = std::stod(std::string(reply->element[i + 1]->str, reply->element[i + 1]->len));
+                result.emplace_back(std::move(member), score);
+            }
+        }
+
+        freeReplyObject(reply);
+        return result;
+    }
+
     bool RedisClient::exists(const std::string &key)
     {
         if (!isConnected())

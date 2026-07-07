@@ -1,33 +1,39 @@
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <map>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
-#include <drogon/drogon.h>
-#include <trantor/utils/Utilities.h>
+#include <nlohmann/json.hpp>
 
+#include "agent/AgentEngine.h"
 #include "common/CacheManager.h"
 #include "common/Config.h"
-#include "common/ConfigLoader.h"
+#include "common/FastDfsClient.h"
 #include "common/Hash.h"
 #include "common/Logger.h"
-#include "common/StringUtil.h"
-#include "common/Types.h"
+#include "common/Sha256.h"
+#include "common/RateLimiter.h"
+#include "common/TextExtractor.h"
 #include "dao/FileDao.h"
-#include "dao/ShareDao.h"
+#include "dao/Models.h"
 #include "dao/SessionDao.h"
+#include "dao/ShareDao.h"
 #include "dao/UserDao.h"
 #include "db/ConnectionPool.h"
 #include "db/MysqlConn.h"
-#include "server/AuthMiddleware.h"
+#include "server/FastCgiServer.h"
 #include "service/AuthService.h"
 #include "service/ChunkUploadService.h"
 #include "service/FileService.h"
 #include "service/LlmService.h"
 #include "service/ShareService.h"
+#include "vector/TextChunker.h"
+#include "vector/VectorStore.h"
 
-using namespace drogon;
+using json = nlohmann::json;
 using namespace fileagent;
 
 namespace
@@ -56,233 +62,349 @@ namespace
     return true;
   }
 
+  // ─── 认证与验证工具 ──────────────────────────────
+
   // 从请求中验证 token 并提取 user_id（0=未认证）
-  std::int64_t getUserIdFromRequest(const HttpRequestPtr &req)
+  std::int64_t authenticateRequest(const HttpRequest &req)
   {
-    return authenticateRequest(req);
+    const auto &auth_header = req.getHeader("Authorization");
+    if (auth_header.empty())
+      return 0;
+
+    const std::string prefix = "Bearer ";
+    if (auth_header.size() <= prefix.size() ||
+        auth_header.substr(0, prefix.size()) != prefix)
+      return 0;
+
+    std::string token = auth_header.substr(prefix.size());
+    if (token.empty())
+      return 0;
+
+    SessionDao session_dao;
+    auto session = session_dao.findByToken(token);
+    if (!session.has_value())
+      return 0;
+
+    return session->user_id;
   }
 
-  // 创建 JSON 响应（message 自动转义）
-  HttpResponsePtr makeJsonResponse(int code, const std::string &message)
+  // 创建 JSON 响应（nlohmann/json 自动转义字符串）
+  void makeJsonResponse(HttpResponse &resp, int code, const std::string &message)
   {
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":" + std::to_string(code) + ",\"message\":\"" + jsonEscape(message) + "\"}");
-    return resp;
+    resp.statusCode = 200;
+    resp.contentType = "application/json";
+    json j;
+    j["code"] = code;
+    j["message"] = message;
+    resp.body = j.dump();
   }
 
   // 认证检查：失败时自动发送 401 并返回 0
-  std::int64_t requireAuth(const HttpRequestPtr &req,
-                           std::function<void(const HttpResponsePtr &)> &callback)
+  std::int64_t requireAuth(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = getUserIdFromRequest(req);
+    std::int64_t user_id = authenticateRequest(req);
     if (user_id == 0)
     {
-      callback(makeJsonResponse(401, "unauthorized"));
+      makeJsonResponse(resp, 401, "unauthorized");
     }
     return user_id;
   }
 
   // JSON 请求体验证：失败时自动发送 400 并返回 nullptr
-  const Json::Value *requireJsonBody(const HttpRequestPtr &req,
-                                     std::function<void(const HttpResponsePtr &)> &callback)
+  const json *requireJsonBody(const HttpRequest &req, HttpResponse &resp)
   {
-    auto json_obj = req->getJsonObject();
-    if (!json_obj)
+    try
     {
-      callback(makeJsonResponse(400, "request body must be JSON"));
+      static thread_local json cached_json;
+      cached_json = json::parse(req.body);
+      return &cached_json;
+    }
+    catch (const std::exception &)
+    {
+      makeJsonResponse(resp, 400, "request body must be JSON");
       return nullptr;
     }
-    // 将 shared_ptr 内容移到静态缓存（避免悬空指针）
-    static thread_local Json::Value cached_json;
-    cached_json = *json_obj;
-    return &cached_json;
+  }
+
+  // ─── LLM 服务全局实例 ─────────────────────────────
+  static std::unique_ptr<LlmService> g_llm_service;
+
+  // ─── 向量存储全局实例 ─────────────────────────────
+  static VectorStore g_vector_store;
+
+  // ─── Agent 引擎全局实例 ─────────────────────────────
+  static AgentEngine g_agent_engine;
+  static RateLimiter g_rate_limiter(10, 60); // 每个 IP 每 60 秒最多 10 次
+
+  // ─── FastDFS 客户端全局实例 ─────────────────────────
+  static std::unique_ptr<FastDfsClient> g_fastdfs;
+  static std::string g_fastdfs_data_path; // Nginx X-Accel-Redirect 的数据目录
+
+  // ─── 存储辅助函数（支持 Local / FastDFS 双后端） ────
+
+  // 写入文件 / 上传到 FastDFS
+  bool storeFile(const std::string &content,
+                 const std::string &filename,
+                 const std::string &file_hash,
+                 std::string &storage_path)
+  {
+    if (g_fastdfs && g_fastdfs->initialized())
+    {
+      // 新文件走 FastDFS
+      return g_fastdfs->upload(content, filename, storage_path, true);
+    }
+    // 本地磁盘
+    storage_path = buildStoragePath(file_hash);
+    std::string dir_part = storage_path.substr(0, storage_path.find_last_of('/'));
+    if (!ensureDirectory(dir_part))
+      return false;
+    std::ofstream out(storage_path, std::ios::binary);
+    if (!out)
+      return false;
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    return true;
+  }
+
+  // 判断是否为 FastDFS file_id（以 "group" 开头）
+  bool isFastDfsPath(const std::string &path)
+  {
+    return path.find("group") == 0 || path.find("Group") == 0;
+  }
+
+  // 将 FastDFS file_id 转为 Nginx X-Accel-Redirect 内部 URL
+  // file_id:  "group1/M00/00/00/filename"
+  // 返回:    "/fastdfs-files/00/00/filename"
+  std::string toFastDfsRedirectUrl(const std::string &file_id)
+  {
+    // 跳过前两段 "group1/M00/" → 保留 "00/00/filename"
+    size_t pos = file_id.find('/');
+    if (pos == std::string::npos)
+      return "";
+    pos = file_id.find('/', pos + 1);
+    if (pos == std::string::npos)
+      return "";
+    return "/fastdfs-files/" + file_id.substr(pos + 1);
+  }
+
+  // 读取文件 / 从 FastDFS 下载
+  bool retrieveFile(const std::string &storage_path, std::string &content)
+  {
+    if (isFastDfsPath(storage_path) && g_fastdfs && g_fastdfs->initialized())
+    {
+      return g_fastdfs->download(storage_path, content);
+    }
+    // 本地磁盘
+    std::ifstream file(storage_path, std::ios::binary | std::ios::ate);
+    if (!file)
+      return false;
+    auto size = file.tellg();
+    file.seekg(0);
+    content.resize(static_cast<size_t>(size));
+    file.read(content.data(), size);
+    return true;
+  }
+
+  // 删除文件 / 从 FastDFS 删除
+  bool deleteStoredFile(const std::string &storage_path)
+  {
+    if (isFastDfsPath(storage_path) && g_fastdfs && g_fastdfs->initialized())
+    {
+      return g_fastdfs->remove(storage_path);
+    }
+    // 本地磁盘
+    if (!storage_path.empty() && std::filesystem::exists(storage_path))
+    {
+      std::error_code ec;
+      std::filesystem::remove(storage_path, ec);
+      return !ec;
+    }
+    return true;
   }
 
   // ─── 路由处理器 ──────────────────────────────────
 
   // GET /health
-  void handleHealth(const HttpRequestPtr &,
-                    std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleHealth(const HttpRequest & /*req*/, HttpResponse &resp)
   {
-    Json::Value json;
-    json["status"] = "ok";
+    json j;
+    j["status"] = "ok";
 
-    // 数据库状态
     auto &pool = ConnectionPool::instance();
-    json["database"]["available"] = static_cast<Json::Int64>(pool.available());
-    json["database"]["active"] = static_cast<Json::Int64>(pool.active());
-    json["database"]["status"] = (pool.available() > 0 || pool.active() > 0) ? "connected" : "disconnected";
+    j["database"]["available"] = static_cast<int64_t>(pool.available());
+    j["database"]["active"] = static_cast<int64_t>(pool.active());
+    j["database"]["status"] = (pool.available() > 0 || pool.active() > 0) ? "connected" : "disconnected";
 
-    // 缓存状态
     auto &cm = CacheManager::instance();
-    json["cache"]["type"] = cm.type();
-    json["cache"]["initialized"] = cm.initialized();
+    j["cache"]["type"] = cm.type();
+    j["cache"]["initialized"] = cm.initialized();
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), json));
-    callback(resp);
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // POST /api/user/register
-  void handleRegister(const HttpRequestPtr &req,
-                      std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleRegister(const HttpRequest &req, HttpResponse &resp)
   {
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    // 限流：每个 IP 每 60 秒最多 10 次注册请求
+    std::string client_ip = req.getHeader("X-Forwarded-For");
+    if (client_ip.empty()) client_ip = req.getHeader("Remote-Addr");
+    if (client_ip.empty()) client_ip = "unknown";
+    if (!g_rate_limiter.allow(client_ip))
+    {
+      makeJsonResponse(resp, 429, "too many requests, please try later");
+      return;
+    }
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
     RegisterRequest reg_req{
-        (*json)["username"].asString(),
-        (*json)["password"].asString(),
-        (*json)["email"].asString(),
+        (*json_body)["username"].get<std::string>(),
+        (*json_body)["password"].get<std::string>(),
+        (*json_body)["email"].get<std::string>(),
     };
 
     AuthService auth_service;
     auto result = auth_service.registerUser(reg_req);
     if (!result.success)
     {
-      callback(makeJsonResponse(400, result.message));
+      makeJsonResponse(resp, 400, result.message);
       return;
     }
 
-    callback(makeJsonResponse(0, "register success"));
+    makeJsonResponse(resp, 0, "register success");
   }
 
   // POST /api/user/login
-  void handleLogin(const HttpRequestPtr &req,
-                   std::function<void(const HttpResponsePtr &)> &&callback)
-  {
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+  void handleLogin(const HttpRequest &req, HttpResponse &resp) {
+    // 限流：每个 IP 每 60 秒最多 10 次登录请求
+    std::string client_ip = req.getHeader("X-Forwarded-For");
+    if (client_ip.empty()) client_ip = req.getHeader("Remote-Addr");
+    if (client_ip.empty()) client_ip = "unknown";
+    if (!g_rate_limiter.allow(client_ip))
+    {
+      makeJsonResponse(resp, 429, "too many requests, please try later");
+      return;
+    }
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
     LoginRequest login_req{
-        (*json)["username"].asString(),
-        (*json)["password"].asString(),
+        (*json_body)["username"].get<std::string>(),
+        (*json_body)["password"].get<std::string>(),
     };
 
-    // 验证用户
     AuthService auth_service;
     auto result = auth_service.login(login_req);
     if (!result.success)
     {
-      callback(makeJsonResponse(401, result.message));
+      makeJsonResponse(resp, 401, result.message);
       return;
     }
 
-    // 生成 session token（64 字符 hex）
     std::string token = PasswordHasher::generateToken(32);
 
-    // 过期时间：7 天
     auto now = std::chrono::system_clock::now();
     auto expires = now + std::chrono::hours(24 * 7);
     auto expires_t = std::chrono::system_clock::to_time_t(expires);
-    std::string expires_str = std::ctime(&expires_t);
-    // ctime 包含换行符，转为 YYYY-MM-DD HH:MM:SS 格式
     char expires_buf[32];
     std::strftime(expires_buf, sizeof(expires_buf), "%Y-%m-%d %H:%M:%S", std::localtime(&expires_t));
 
-    // 保存 session
     SessionDao session_dao;
     if (!session_dao.createSession(result.data->id, token, expires_buf))
     {
       logError("handleLogin: failed to create session");
-      callback(makeJsonResponse(500, "failed to create session"));
+      makeJsonResponse(resp, 500, "failed to create session");
       return;
     }
 
-    // 返回 token
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"login success\",\"token\":\"" + token + "\",\"user_id\":" + std::to_string(result.data->id) + "}");
-    callback(resp);
+    json j;
+    j["code"] = 0;
+    j["message"] = "login success";
+    j["token"] = token;
+    j["user_id"] = result.data->id;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // POST /api/user/logout
-  void handleLogout(const HttpRequestPtr &req,
-                    std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleLogout(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    const auto &auth_header = req->getHeader("Authorization");
+    const auto &auth_header = req.getHeader("Authorization");
     std::string token = auth_header.substr(7); // 跳过 "Bearer "
 
     SessionDao session_dao;
     session_dao.deleteByToken(token);
 
-    callback(makeJsonResponse(0, "logout success"));
+    makeJsonResponse(resp, 0, "logout success");
   }
 
   // POST /api/files/upload
-  void handleUpload(const HttpRequestPtr &req,
-                    std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleUpload(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    // 解析 multipart 请求
-    MultiPartParser parser;
-    if (parser.parse(req) != 0 || parser.getFiles().empty())
+    // 解析 multipart/form-data
+    std::string ct = req.getHeader("Content-Type");
+    size_t bpos = ct.find("boundary=");
+    if (bpos == std::string::npos)
     {
-      callback(makeJsonResponse(400, "no file uploaded"));
+      makeJsonResponse(resp, 400, "Content-Type must be multipart/form-data");
+      return;
+    }
+    std::string boundary = ct.substr(bpos + 9);
+    auto files = parseMultipartFormData(req.body, boundary);
+
+    if (files.empty())
+    {
+      makeJsonResponse(resp, 400, "no file uploaded");
       return;
     }
 
-    auto &upload_file = parser.getFiles()[0];
-    std::string filename = upload_file.getFileName();
-    std::string file_content(upload_file.fileContent());
+    auto &upload_file = files[0];
+    std::string filename = upload_file.filename;
+    std::string file_content = std::move(upload_file.content);
 
     if (file_content.empty())
     {
-      callback(makeJsonResponse(400, "empty file"));
+      makeJsonResponse(resp, 400, "empty file");
       return;
     }
 
     // 计算 SHA-256 哈希
-    auto hash_bytes = trantor::utils::sha256(file_content);
-    std::string file_hash = trantor::utils::toHexString(hash_bytes);
+    auto hash_bytes = sha256(file_content);
+    std::string file_hash = toHexString(hash_bytes);
 
     // 检查文件是否已存在（去重）
     FileService file_service;
     auto existing = file_service.getFileByHash(file_hash);
     if (existing.success)
     {
-      // 已存在相同文件，直接返回已有记录
       auto &file = *existing.data;
-      auto resp = HttpResponse::newHttpResponse();
-      resp->setStatusCode(k200OK);
-      resp->setContentTypeCode(CT_APPLICATION_JSON);
-      resp->setBody("{\"code\":0,\"message\":\"file already exists\",\"file_id\":" + std::to_string(file.id) + ",\"hash\":\"" + file.file_hash + "\"}");
-      callback(resp);
+      json j;
+      j["code"] = 0;
+      j["message"] = "file already exists";
+      j["file_id"] = file.id;
+      j["hash"] = file.file_hash;
+      resp.contentType = "application/json";
+      resp.body = j.dump();
       return;
     }
 
-    // 构建存储路径
-    std::string storage_path = buildStoragePath(file_hash);
-    std::string dir_part = storage_path.substr(0, storage_path.find_last_of('/'));
-
-    // 确保目录存在
-    if (!ensureDirectory(dir_part))
+    // 存储到后端（本地磁盘或 FastDFS）
+    std::string storage_path;
+    if (!storeFile(file_content, filename, file_hash, storage_path))
     {
-      logError("handleUpload: failed to create directory: " + dir_part);
-      callback(makeJsonResponse(500, "failed to create storage directory"));
+      logError("handleUpload: failed to store file");
+      makeJsonResponse(resp, 500, "failed to store file");
       return;
-    }
-
-    // 写入磁盘
-    {
-      std::ofstream outfile(storage_path, std::ios::binary);
-      if (!outfile)
-      {
-        logError("handleUpload: failed to write file: " + storage_path);
-        callback(makeJsonResponse(500, "failed to write file"));
-        return;
-      }
-      outfile.write(file_content.data(), static_cast<std::streamsize>(file_content.size()));
     }
 
     // 入库
@@ -298,9 +420,8 @@ namespace
     if (!create_result.success)
     {
       logError("handleUpload: failed to create file record: " + create_result.message);
-      // 清理已写入的文件
       std::filesystem::remove(storage_path);
-      callback(makeJsonResponse(500, "failed to create file record"));
+      makeJsonResponse(resp, 500, "failed to create file record");
       return;
     }
 
@@ -309,76 +430,153 @@ namespace
             ", size=" + std::to_string(record.file_size) +
             ", hash=" + file_hash);
 
-    auto &created = *create_result.data;
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"upload success\",\"file_id\":" + std::to_string(created.id) + ",\"hash\":\"" + file_hash + "\"}");
-    callback(resp);
+    // ─── AI 处理：文本提取 → 分块 → 向量化 → 索引 ──────
+    // 注意：AI 处理失败不影响上传成功
+    auto &created_file = *create_result.data;
+    std::int64_t created_file_id = created_file.id;
+
+    auto extract_result = TextExtractor::extract(file_content, filename);
+    if (extract_result.success)
+    {
+        // 分块
+        auto chunks = TextChunker::chunkByParagraph(
+            extract_result.text, filename, created_file_id, 1000);
+
+        if (!chunks.empty())
+        {
+            logInfo("AI: extracted " + std::to_string(extract_result.text.size()) +
+                    " chars, " + std::to_string(chunks.size()) + " chunks");
+
+            // 逐块生成 embedding 并加入向量索引
+            int indexed = 0;
+            for (auto &chunk : chunks)
+            {
+                auto embed_result = g_llm_service->embed(chunk.content);
+                if (embed_result.success && embed_result.data)
+                {
+                    VectorStore::Document doc;
+                    doc.chunk_id = std::to_string(created_file_id) + ":" + std::to_string(chunk.index);
+                    doc.file_id = created_file_id;
+                    doc.content = chunk.content;
+                    doc.filename = filename;
+                    doc.embedding = std::move(*embed_result.data);
+                    doc.chunk_index = chunk.index;
+                    g_vector_store.addDocument(std::move(doc));
+                    indexed++;
+                }
+            }
+
+            logInfo("AI: indexed " + std::to_string(indexed) + " chunks for file " +
+                    std::to_string(created_file_id));
+
+            // 可选：生成摘要和标签（使用第一个块作为摘要源）
+            if (!chunks.empty())
+            {
+                std::string first_chunk = chunks[0].content.substr(0, 2000);
+                auto summary_result = g_llm_service->analyze(
+                    first_chunk,
+                    "用一句话简要概括这个文件的内容，不超过50字。");
+                auto tags_result = g_llm_service->analyze(
+                    first_chunk,
+                    "为这个文件生成3-5个关键词标签，用逗号分隔，不要多余文字。");
+
+                std::string summary;
+                std::string tags;
+
+                if (summary_result.success && summary_result.data)
+                    summary = std::move(*summary_result.data);
+                if (tags_result.success && tags_result.data)
+                    tags = std::move(*tags_result.data);
+
+                // 更新数据库中的摘要和标签
+                if (!summary.empty() || !tags.empty())
+                {
+                    FileDao file_dao;
+                    file_dao.updateFileMeta(created_file_id, summary, tags);
+                    logInfo("AI: updated meta for file " + std::to_string(created_file_id));
+                }
+            }
+        }
+    }
+    else
+    {
+        logInfo("AI: no extractable content for file " + std::to_string(created_file_id) +
+                " (" + filename + ")");
+    }
+
+    json j;
+    j["code"] = 0;
+    j["message"] = "upload success";
+    j["file_id"] = created_file_id;
+    j["hash"] = file_hash;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // ─── 分片上传 ──────────────────────────────────
 
   // POST /api/files/upload/init
-  void handleChunkInit(const HttpRequestPtr &req,
-                       std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleChunkInit(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
-    std::string filename = (*json)["filename"].asString();
-    std::int64_t file_size = (*json)["file_size"].asInt64();
-    int total_chunks = (*json)["total_chunks"].asInt();
-    int chunk_size = (*json)["chunk_size"].asInt();
+    std::string filename = (*json_body)["filename"].get<std::string>();
+    std::int64_t file_size = (*json_body)["file_size"].get<int64_t>();
+    int total_chunks = (*json_body)["total_chunks"].get<int>();
+    int chunk_size = (*json_body)["chunk_size"].get<int>();
 
     if (filename.empty() || file_size <= 0 || total_chunks <= 0 || chunk_size <= 0)
     {
-      callback(makeJsonResponse(400, "invalid parameters"));
+      makeJsonResponse(resp, 400, "invalid parameters");
       return;
     }
 
     std::string upload_id = ChunkUploadManager::instance().createSession(
         user_id, filename, file_size, total_chunks, chunk_size);
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"init success\",\"upload_id\":\"" + upload_id + "\"}");
-    callback(resp);
+    json j;
+    j["code"] = 0;
+    j["message"] = "init success";
+    j["upload_id"] = upload_id;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // POST /api/files/upload/{uploadId}/{chunkIndex}
-  void handleChunkUpload(const HttpRequestPtr &req,
-                         std::function<void(const HttpResponsePtr &)> &&callback,
-                         const std::string &uploadId,
-                         const std::string &chunkIndexStr)
+  void handleChunkUpload(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
+
+    std::string uploadId = req.getParam("uploadId");
+    std::string chunkIndexStr = req.getParam("chunkIndex");
 
     auto session = ChunkUploadManager::instance().getSession(uploadId);
     if (!session || session->user_id != user_id)
     {
-      callback(makeJsonResponse(404, "upload session not found"));
+      makeJsonResponse(resp, 404, "upload session not found");
       return;
     }
 
     int chunk_index = std::stoi(chunkIndexStr);
     if (chunk_index < 0 || chunk_index >= session->total_chunks)
     {
-      callback(makeJsonResponse(400, "invalid chunk index"));
+      makeJsonResponse(resp, 400, "invalid chunk index");
       return;
     }
 
-    // 读取请求 body 作为分片数据
-    std::string chunk_data = std::string(req->getBody());
-
+    // 请求体就是分片数据
+    const std::string &chunk_data = req.body;
     if (chunk_data.empty())
     {
-      callback(makeJsonResponse(400, "empty chunk"));
+      makeJsonResponse(resp, 400, "empty chunk");
       return;
     }
 
@@ -391,7 +589,7 @@ namespace
       std::ofstream out(chunk_path, std::ios::binary);
       if (!out)
       {
-        callback(makeJsonResponse(500, "failed to write chunk"));
+        makeJsonResponse(resp, 500, "failed to write chunk");
         return;
       }
       out.write(chunk_data.data(), chunk_data.size());
@@ -402,34 +600,34 @@ namespace
     logDebug("ChunkUpload: received chunk " + chunkIndexStr + "/" +
              std::to_string(session->total_chunks) + " for " + uploadId);
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"chunk received\"}");
-    callback(resp);
+    makeJsonResponse(resp, 0, "chunk received");
   }
 
   // POST /api/files/upload/{uploadId}/complete
-  void handleChunkComplete(const HttpRequestPtr &req,
-                           std::function<void(const HttpResponsePtr &)> &&callback,
-                           const std::string &uploadId)
+  void handleChunkComplete(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
+
+    std::string uploadId = req.getParam("uploadId");
 
     auto session = ChunkUploadManager::instance().getSession(uploadId);
     if (!session || session->user_id != user_id)
     {
-      callback(makeJsonResponse(404, "upload session not found"));
+      makeJsonResponse(resp, 404, "upload session not found");
       return;
     }
 
-    // 检查所有分片是否已接收
     if (static_cast<int>(session->received.size()) != session->total_chunks)
     {
-      callback(makeJsonResponse(400, "not all chunks received: " +
-                                         std::to_string(session->received.size()) + "/" +
-                                         std::to_string(session->total_chunks)));
+      json j;
+      j["code"] = 400;
+      j["message"] = "not all chunks received";
+      j["received"] = static_cast<int>(session->received.size());
+      j["total"] = session->total_chunks;
+      resp.contentType = "application/json";
+      resp.body = j.dump();
       return;
     }
 
@@ -441,7 +639,7 @@ namespace
       std::ofstream merged(merged_path, std::ios::binary);
       if (!merged)
       {
-        callback(makeJsonResponse(500, "failed to create merged file"));
+        makeJsonResponse(resp, 500, "failed to create merged file");
         return;
       }
 
@@ -451,7 +649,7 @@ namespace
         std::ifstream chunk(chunk_path, std::ios::binary);
         if (!chunk)
         {
-          callback(makeJsonResponse(500, "failed to read chunk " + std::to_string(i)));
+          makeJsonResponse(resp, 500, "failed to read chunk " + std::to_string(i));
           return;
         }
         merged << chunk.rdbuf();
@@ -464,7 +662,7 @@ namespace
       std::ifstream merged_in(merged_path, std::ios::binary | std::ios::ate);
       if (!merged_in)
       {
-        callback(makeJsonResponse(500, "failed to read merged file"));
+        makeJsonResponse(resp, 500, "failed to read merged file");
         return;
       }
       auto size = merged_in.tellg();
@@ -473,25 +671,20 @@ namespace
       merged_in.read(merged_content.data(), size);
     }
 
-    auto hash_bytes = trantor::utils::sha256(merged_content);
-    std::string file_hash = trantor::utils::toHexString(hash_bytes);
+    auto hash_bytes = sha256(merged_content);
+    std::string file_hash = toHexString(hash_bytes);
 
-    // 移动到最终存储路径
+    // 存储到后端（本地磁盘或 FastDFS）
     std::string storage_path;
-    if (file_hash.size() >= 2)
+    if (!storeFile(merged_content, session->filename, file_hash, storage_path))
     {
-      storage_path = "uploads/" + file_hash.substr(0, 2) + "/" + file_hash;
+      logError("handleChunkComplete: failed to store merged file");
+      makeJsonResponse(resp, 500, "failed to store merged file");
+      return;
     }
-    else
-    {
-      storage_path = "uploads/" + file_hash;
-    }
-
-    {
-      std::string dir_part = storage_path.substr(0, storage_path.find_last_of('/'));
-      std::filesystem::create_directories(dir_part);
-      std::filesystem::rename(merged_path, storage_path);
-    }
+    // 清理合并临时文件
+    std::error_code ec;
+    std::filesystem::remove(merged_path, ec);
 
     // 创建文件记录
     FileRecord record;
@@ -512,7 +705,7 @@ namespace
     if (!result.success)
     {
       logError("handleChunkComplete: " + result.message);
-      callback(makeJsonResponse(500, result.message));
+      makeJsonResponse(resp, 500, result.message);
       return;
     }
 
@@ -520,372 +713,519 @@ namespace
             " file_id=" + std::to_string(result.data->id) +
             " hash=" + file_hash);
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"upload complete\",\"file_id\":" +
-                  std::to_string(result.data->id) + ",\"hash\":\"" + file_hash + "\"}");
-    callback(resp);
+    json j;
+    j["code"] = 0;
+    j["message"] = "upload complete";
+    j["file_id"] = result.data->id;
+    j["hash"] = file_hash;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // GET /api/files/upload/{uploadId}/status
-  void handleChunkStatus(const HttpRequestPtr &req,
-                         std::function<void(const HttpResponsePtr &)> &&callback,
-                         const std::string &uploadId)
+  void handleChunkStatus(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
+
+    std::string uploadId = req.getParam("uploadId");
 
     auto session = ChunkUploadManager::instance().getSession(uploadId);
     if (!session || session->user_id != user_id)
     {
-      callback(makeJsonResponse(404, "upload session not found"));
+      makeJsonResponse(resp, 404, "upload session not found");
       return;
     }
 
-    // 构建已接收分片列表
-    Json::Value received_json(Json::arrayValue);
+    json received_json = json::array();
     for (int idx : session->received)
     {
-      received_json.append(idx);
+      received_json.push_back(idx);
     }
 
-    Json::Value resp_json;
-    resp_json["code"] = 0;
-    resp_json["message"] = "query success";
-    resp_json["upload_id"] = uploadId;
-    resp_json["filename"] = session->filename;
-    resp_json["file_size"] = session->file_size;
-    resp_json["total_chunks"] = session->total_chunks;
-    resp_json["received_chunks"] = static_cast<int>(session->received.size());
-    resp_json["chunks"] = received_json;
+    json j;
+    j["code"] = 0;
+    j["message"] = "query success";
+    j["upload_id"] = uploadId;
+    j["filename"] = session->filename;
+    j["file_size"] = session->file_size;
+    j["total_chunks"] = session->total_chunks;
+    j["received_chunks"] = static_cast<int>(session->received.size());
+    j["chunks"] = received_json;
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
-    callback(resp);
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // GET /api/files
-  void handleListFiles(const HttpRequestPtr &req,
-                       std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleListFiles(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    // 解析分页参数
     int limit = 20;
     int offset = 0;
-    auto limit_param = req->getParameter("limit");
-    auto offset_param = req->getParameter("offset");
-    if (!limit_param.empty())
-      limit = std::stoi(limit_param);
-    if (!offset_param.empty())
-      offset = std::stoi(offset_param);
+    auto limit_str = req.getQuery("limit");
+    auto offset_str = req.getQuery("offset");
+    if (!limit_str.empty())
+      limit = std::stoi(limit_str);
+    if (!offset_str.empty())
+      offset = std::stoi(offset_str);
 
     FileService file_service;
     auto result = file_service.listUserFiles(user_id, limit, offset);
     if (!result.success)
     {
-      callback(makeJsonResponse(400, result.message));
+      makeJsonResponse(resp, 400, result.message);
       return;
     }
 
-    // 构建 JSON 数组
-    Json::Value files_json(Json::arrayValue);
+    json files_json = json::array();
     for (const auto &f : result.data)
     {
-      Json::Value item;
+      json item;
       item["id"] = f.id;
       item["filename"] = f.filename;
       item["file_hash"] = f.file_hash;
       item["file_size"] = f.file_size;
       item["status"] = f.status;
       item["created_at"] = f.created_at;
-      files_json.append(item);
+      files_json.push_back(item);
     }
 
-    Json::Value resp_json;
-    resp_json["code"] = 0;
-    resp_json["message"] = "query success";
-    resp_json["files"] = files_json;
-    resp_json["total"] = static_cast<int>(result.data.size());
+    json j;
+    j["code"] = 0;
+    j["message"] = "query success";
+    j["files"] = files_json;
+    j["total"] = static_cast<int>(result.data.size());
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
-    callback(resp);
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // GET /api/files/{fileId}
-  void handleDownload(const HttpRequestPtr &req,
-                      std::function<void(const HttpResponsePtr &)> &&callback,
-                      const std::string &fileId_str)
+  void handleDownload(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    std::int64_t file_id = std::stoll(fileId_str);
+    std::string fileIdStr = req.getParam("fileId");
+    std::int64_t file_id = std::stoll(fileIdStr);
+
     FileService file_service;
     auto result = file_service.getFileById(file_id);
     if (!result.success)
     {
-      callback(makeJsonResponse(404, "file not found"));
+      makeJsonResponse(resp, 404, "file not found");
       return;
     }
 
     auto &file = *result.data;
-
-    // 验证文件属于当前用户
     if (file.user_id != user_id)
     {
-      callback(makeJsonResponse(403, "access denied"));
+      makeJsonResponse(resp, 403, "access denied");
       return;
     }
 
-    // 检查文件是否在磁盘上存在
-    if (!std::filesystem::exists(file.storage_path))
+    // 如果配置了 FastDFS 数据路径且文件在 FastDFS 上，使用 X-Accel-Redirect
+    if (isFastDfsPath(file.storage_path) && !g_fastdfs_data_path.empty())
     {
-      logError("handleDownload: file not found on disk: " + file.storage_path);
-      callback(makeJsonResponse(404, "file not found on disk"));
+      std::string redirect_url = toFastDfsRedirectUrl(file.storage_path);
+      if (!redirect_url.empty())
+      {
+        resp.statusCode = 200;
+        resp.setHeader("X-Accel-Redirect", redirect_url);
+        resp.setHeader("Content-Disposition",
+                       "attachment; filename=\"" + file.filename + "\"");
+        // body stays empty - Nginx will serve the file
+        return;
+      }
+    }
+
+    // 回退：通过应用读取文件（本地磁盘或 FastDFS API）
+    std::string file_content;
+    if (!retrieveFile(file.storage_path, file_content))
+    {
+      logError("handleDownload: file not found: " + file.storage_path);
+      makeJsonResponse(resp, 404, "file not found");
       return;
     }
 
-    // 流式返回文件
-    auto resp = HttpResponse::newFileResponse(file.storage_path);
-    resp->addHeader("Content-Disposition", "attachment; filename=\"" + file.filename + "\"");
-    callback(resp);
+    resp.body = std::move(file_content);
+    resp.contentType = "application/octet-stream";
+    resp.setHeader("Content-Disposition",
+                   "attachment; filename=\"" + file.filename + "\"");
   }
 
   // DELETE /api/files/{fileId}
-  void handleDelete(const HttpRequestPtr &req,
-                    std::function<void(const HttpResponsePtr &)> &&callback,
-                    const std::string &fileId_str)
+  void handleDelete(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    std::int64_t file_id = std::stoll(fileId_str);
+    std::string fileIdStr = req.getParam("fileId");
+    std::int64_t file_id = std::stoll(fileIdStr);
 
-    // 验证文件属于当前用户
     FileService file_service;
     auto file_result = file_service.getFileById(file_id);
     if (!file_result.success)
     {
-      callback(makeJsonResponse(404, "file not found"));
+      makeJsonResponse(resp, 404, "file not found");
       return;
     }
 
     if (file_result.data->user_id != user_id)
     {
-      callback(makeJsonResponse(403, "access denied"));
+      makeJsonResponse(resp, 403, "access denied");
       return;
     }
 
-    // 删除磁盘文件
     const auto &storage_path = file_result.data->storage_path;
-    if (!storage_path.empty() && std::filesystem::exists(storage_path))
+    if (!storage_path.empty())
     {
-      std::error_code ec;
-      std::filesystem::remove(storage_path, ec);
-      if (ec)
+      if (!deleteStoredFile(storage_path))
       {
-        logWarn("handleDelete: failed to delete file on disk: " + storage_path + " - " + ec.message());
+        logWarn("handleDelete: failed to delete file: " + storage_path);
       }
     }
 
-    // 删除数据库记录
     auto status_result = file_service.removeFile(file_id);
     if (!status_result.success)
     {
-      callback(makeJsonResponse(500, status_result.message));
+      makeJsonResponse(resp, 500, status_result.message);
       return;
     }
 
     logInfo("File deleted: user=" + std::to_string(user_id) + ", file_id=" + std::to_string(file_id));
-    callback(makeJsonResponse(0, "delete success"));
+    makeJsonResponse(resp, 0, "delete success");
   }
 
   // ─── 分享链接 ──────────────────────────────────
 
-  // POST /api/shares  (auth)
-  void handleShareCreate(const HttpRequestPtr &req,
-                         std::function<void(const HttpResponsePtr &)> &&callback)
+  // POST /api/shares
+  void handleShareCreate(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
-    std::int64_t file_id = (*json)["file_id"].asInt64();
-    int expire_hours = (*json)["expire_hours"].asInt();
+    std::int64_t file_id = (*json_body)["file_id"].get<int64_t>();
+    int expire_hours = (*json_body)["expire_hours"].get<int>();
 
     ShareService share_service;
     auto result = share_service.createShare(user_id, file_id, expire_hours);
     if (!result.success)
     {
-      callback(makeJsonResponse(400, result.message));
+      makeJsonResponse(resp, 400, result.message);
       return;
     }
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"share created\",\"share_token\":\"" +
-                  *result.data + "\",\"url\":\"/api/shares/" + *result.data + "\"}");
-    callback(resp);
+    json j;
+    j["code"] = 0;
+    j["message"] = "share created";
+    j["share_token"] = *result.data;
+    j["url"] = "/api/shares/" + *result.data;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
-  // GET /api/shares/{token}  (public)
-  void handleShareAccess(const HttpRequestPtr & /*req*/,
-                         std::function<void(const HttpResponsePtr &)> &&callback,
-                         const std::string &token)
+  // DELETE /api/shares/{token}
+  void handleShareDelete(const HttpRequest &req, HttpResponse &resp)
   {
-    ShareDao share_dao;
-    auto share = share_dao.findByToken(token);
-    if (!share.has_value())
-    {
-      callback(makeJsonResponse(404, "share not found or expired"));
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
       return;
-    }
 
-    FileService file_service;
-    auto file_result = file_service.getFileById(share->file_id);
-    if (!file_result.success)
-    {
-      callback(makeJsonResponse(404, "file not found"));
-      return;
-    }
-
-    auto &file = *file_result.data;
-    if (!std::filesystem::exists(file.storage_path))
-    {
-      callback(makeJsonResponse(404, "file not found on disk"));
-      return;
-    }
-
-    auto resp = HttpResponse::newFileResponse(file.storage_path);
-    resp->addHeader("Content-Disposition", "attachment; filename=\"" + file.filename + "\"");
-    callback(resp);
-  }
-
-  // DELETE /api/shares/{token}  (auth)
-  void handleShareDelete(const HttpRequestPtr &req,
-                         std::function<void(const HttpResponsePtr &)> &&callback,
-                         const std::string &token)
-  {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::string token = req.getParam("token");
 
     ShareDao share_dao;
     auto share = share_dao.findByToken(token);
     if (!share.has_value())
     {
-      callback(makeJsonResponse(404, "share not found"));
+      makeJsonResponse(resp, 404, "share not found");
       return;
     }
     if (share->user_id != user_id)
     {
-      callback(makeJsonResponse(403, "access denied"));
+      makeJsonResponse(resp, 403, "access denied");
       return;
     }
 
     share_dao.deleteByToken(token);
-    callback(makeJsonResponse(0, "share deleted"));
+    makeJsonResponse(resp, 0, "share deleted");
   }
 
-  // GET /api/shares  (auth)
-  void handleShareList(const HttpRequestPtr &req,
-                       std::function<void(const HttpResponsePtr &)> &&callback)
+  // GET /api/shares
+  void handleShareList(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
     ShareDao share_dao;
     auto shares = share_dao.listByUserId(user_id);
 
-    Json::Value shares_json(Json::arrayValue);
+    json shares_json = json::array();
     for (const auto &s : shares)
     {
-      Json::Value item;
+      json item;
       item["id"] = s.id;
       item["file_id"] = s.file_id;
       item["share_token"] = s.share_token;
       item["url"] = "/api/shares/" + s.share_token;
       item["expires_at"] = s.expires_at;
       item["created_at"] = s.created_at;
-      shares_json.append(item);
+      shares_json.push_back(item);
     }
 
-    Json::Value resp_json;
-    resp_json["code"] = 0;
-    resp_json["message"] = "query success";
-    resp_json["shares"] = shares_json;
-    resp_json["total"] = static_cast<int>(shares.size());
+    json j;
+    j["code"] = 0;
+    j["message"] = "query success";
+    j["shares"] = shares_json;
+    j["total"] = static_cast<int>(shares.size());
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
-    callback(resp);
+    resp.contentType = "application/json";
+    resp.body = j.dump();
+  }
+
+  // POST /api/shares/{token}/save
+  void handleShareSave(const HttpRequest &req, HttpResponse &resp)
+  {
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
+
+    std::string token = req.getParam("token");
+
+    // 查找分享
+    ShareDao share_dao;
+    auto share = share_dao.findByToken(token);
+    if (!share.has_value())
+    {
+      makeJsonResponse(resp, 404, "share not found or expired");
+      return;
+    }
+
+    // 不能转存自己的文件
+    if (share->user_id == user_id)
+    {
+      makeJsonResponse(resp, 400, "cannot save your own share");
+      return;
+    }
+
+    // 获取原文件
+    FileService file_service;
+    auto file_result = file_service.getFileById(share->file_id);
+    if (!file_result.success)
+    {
+      makeJsonResponse(resp, 404, "original file not found");
+      return;
+    }
+
+    auto &original = *file_result.data;
+
+    // 检查是否已转存过（同一用户 + 同一文件哈希）
+    auto existing = file_service.getFileByHash(original.file_hash);
+    if (existing.success)
+    {
+      auto &dup = *existing.data;
+      if (dup.user_id == user_id)
+      {
+        json j;
+        j["code"] = 0;
+        j["message"] = "file already saved";
+        j["file_id"] = dup.id;
+        resp.contentType = "application/json";
+        resp.body = j.dump();
+        return;
+      }
+    }
+
+    // 创建新文件记录（指向同一存储路径）
+    FileRecord new_record;
+    new_record.user_id = user_id;
+    new_record.filename = original.filename;
+    new_record.file_hash = original.file_hash;
+    new_record.file_size = original.file_size;
+    new_record.storage_path = original.storage_path;
+    new_record.status = 1;
+    new_record.summary = original.summary;
+    new_record.tags = original.tags;
+
+    auto create_result = file_service.createFile(new_record);
+    if (!create_result.success)
+    {
+      makeJsonResponse(resp, 500, "failed to save file");
+      return;
+    }
+
+    logInfo("Share saved: user=" + std::to_string(user_id) +
+            ", file_id=" + std::to_string(share->file_id) +
+            ", token=" + token);
+
+    json j;
+    j["code"] = 0;
+    j["message"] = "file saved successfully";
+    j["file_id"] = create_result.data->id;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
+  }
+
+  // GET /api/shares/ranking
+  void handleShareRanking(const HttpRequest &req, HttpResponse &resp)
+  {
+    // 公开接口，不需要认证
+    int limit = 10;
+    auto limit_str = req.getQuery("limit");
+    if (!limit_str.empty())
+      limit = std::stoi(limit_str);
+
+    json results = json::array();
+
+    // 尝试从 Redis 获取排行榜
+    auto &cm = CacheManager::instance();
+    // 检查是否 Redis 模式
+    if (cm.type() == "redis")
+    {
+      // 需要通过 CacheManager 获取 RedisClient
+      // 目前 CacheManager 不暴露 RedisClient，我们先用 SQL 查询
+      // 这里使用 shares 表的访问计数（如果有的话）
+      // 简化实现：使用 SQL 统计分享次数
+    }
+
+    // 后备方案：从数据库统计各文件的分享次数
+    auto conn = ConnectionPool::instance().getConnection();
+    if (conn)
+    {
+      std::string sql = "SELECT s.file_id, f.filename, f.user_id, u.username, COUNT(*) as share_count "
+                        "FROM shares s "
+                        "JOIN files f ON s.file_id = f.id "
+                        "JOIN users u ON f.user_id = u.id "
+                        "GROUP BY s.file_id ORDER BY share_count DESC LIMIT " +
+                        std::to_string(limit);
+      if (conn->query(sql))
+      {
+        while (conn->next())
+        {
+          json item;
+          item["file_id"] = conn->value(0) ? std::stoll(conn->value(0)) : 0;
+          item["filename"] = conn->value(1) ? conn->value(1) : "";
+          item["user_id"] = conn->value(2) ? std::stoll(conn->value(2)) : 0;
+          item["username"] = conn->value(3) ? conn->value(3) : "";
+          item["share_count"] = conn->value(4) ? std::stoll(conn->value(4)) : 0;
+          results.push_back(std::move(item));
+        }
+      }
+    }
+
+    json j;
+    j["code"] = 0;
+    j["message"] = "success";
+    j["ranking"] = results;
+    j["total"] = static_cast<int>(results.size());
+    resp.contentType = "application/json";
+    resp.body = j.dump();
+  }
+
+  // ─── 文件秒传确认 ──────────────────────────────────
+
+  // POST /api/files/check
+  void handleFileCheck(const HttpRequest &req, HttpResponse &resp)
+  {
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
+
+    std::string file_hash = (*json_body)["file_hash"].get<std::string>();
+    if (file_hash.empty())
+    {
+      makeJsonResponse(resp, 400, "file_hash is required");
+      return;
+    }
+
+    FileService file_service;
+    auto existing = file_service.getFileByHash(file_hash);
+
+    json j;
+    j["code"] = 0;
+    j["message"] = "ok";
+
+    if (existing.success)
+    {
+      j["data"]["exists"] = true;
+      j["data"]["file_id"] = existing.data->id;
+      j["data"]["file_size"] = existing.data->file_size;
+      j["data"]["filename"] = existing.data->filename;
+    }
+    else
+    {
+      j["data"]["exists"] = false;
+    }
+
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // ─── LLM ─────────────────────────────────────────
 
-  // 全局 LLM 服务实例（main 中初始化）
-  static std::unique_ptr<LlmService> g_llm_service;
-
   // POST /api/llm/chat
-  void handleLlmChat(const HttpRequestPtr &req,
-                     std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleLlmChat(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
-    std::string prompt = (*json)["prompt"].asString();
+    std::string prompt = (*json_body)["prompt"].get<std::string>();
     if (prompt.empty())
     {
-      callback(makeJsonResponse(400, "prompt is empty"));
+      makeJsonResponse(resp, 400, "prompt is empty");
       return;
     }
 
     auto result = g_llm_service->chat(prompt);
     if (!result.success)
     {
-      callback(makeJsonResponse(500, result.message));
+      makeJsonResponse(resp, 500, result.message);
       return;
     }
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"success\",\"response\":\"" +
-                  jsonEscape(*result.data) + "\"}");
-    callback(resp);
+    json j;
+    j["code"] = 0;
+    j["message"] = "success";
+    j["response"] = *result.data;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // POST /api/llm/analyze
-  void handleLlmAnalyze(const HttpRequestPtr &req,
-                        std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleLlmAnalyze(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
 
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
-    std::int64_t file_id = (*json)["file_id"].asInt64();
-    std::string instruction = (*json)["instruction"].asString();
+    std::int64_t file_id = (*json_body)["file_id"].get<int64_t>();
+    std::string instruction = (*json_body)["instruction"].get<std::string>();
 
     if (file_id <= 0 || instruction.empty())
     {
-      callback(makeJsonResponse(400, "file_id and instruction are required"));
+      makeJsonResponse(resp, 400, "file_id and instruction are required");
       return;
     }
 
@@ -893,23 +1233,22 @@ namespace
     auto file = file_service.getFileById(file_id);
     if (!file.success)
     {
-      callback(makeJsonResponse(404, "file not found"));
+      makeJsonResponse(resp, 404, "file not found");
       return;
     }
 
     if (file.data->user_id != user_id)
     {
-      callback(makeJsonResponse(403, "access denied"));
+      makeJsonResponse(resp, 403, "access denied");
       return;
     }
 
-    // 读取文件文本内容
     std::string file_content;
     {
       std::ifstream in(file.data->storage_path);
       if (!in)
       {
-        callback(makeJsonResponse(500, "failed to read file"));
+        makeJsonResponse(resp, 500, "failed to read file");
         return;
       }
       std::stringstream ss;
@@ -926,128 +1265,241 @@ namespace
     auto result = g_llm_service->analyze(file_content, instruction);
     if (!result.success)
     {
-      callback(makeJsonResponse(500, result.message));
+      makeJsonResponse(resp, 500, result.message);
       return;
     }
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody("{\"code\":0,\"message\":\"success\",\"analysis\":\"" +
-                  jsonEscape(*result.data) + "\"}");
-    callback(resp);
+    json j;
+    j["code"] = 0;
+    j["message"] = "success";
+    j["analysis"] = *result.data;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
+  }
+
+  // ─── 语义搜索 ─────────────────────────────────────────
+
+  // POST /api/search
+  void handleSearch(const HttpRequest &req, HttpResponse &resp)
+  {
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
+
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
+
+    std::string query = (*json_body)["query"].get<std::string>();
+    if (query.empty())
+    {
+      makeJsonResponse(resp, 400, "query is required");
+      return;
+    }
+
+    int limit = (*json_body)["limit"].get<int>();
+    if (limit <= 0 || limit > 100)
+      limit = 10;
+
+    // 1. 生成查询向量
+    auto embed_result = g_llm_service->embed(query);
+    if (!embed_result.success || !embed_result.data)
+    {
+      makeJsonResponse(resp, 500, "failed to generate query embedding");
+      return;
+    }
+
+    // 2. 在向量存储中搜索
+    auto results = g_vector_store.search(*embed_result.data, limit);
+
+    // 3. 按 file_id 去重聚合，只保留最高分的块
+    std::map<std::int64_t, VectorStore::SearchResult> best_per_file;
+    for (auto &r : results)
+    {
+      auto it = best_per_file.find(r.file_id);
+      if (it == best_per_file.end() || r.score > it->second.score)
+      {
+        best_per_file[r.file_id] = std::move(r);
+      }
+    }
+
+    // 4. 获取文件信息并构建响应
+    json results_json = json::array();
+    FileService file_service;
+
+    for (auto &[fid, sr] : best_per_file)
+    {
+      auto file_result = file_service.getFileById(fid);
+      if (!file_result.success)
+        continue;
+
+      auto &file = *file_result.data;
+
+      json item;
+      item["file_id"] = file.id;
+      item["filename"] = file.filename;
+      item["file_size"] = file.file_size;
+      item["score"] = sr.score;
+      item["snippet"] = sr.content.substr(0, 200); // 只返回片段
+      item["summary"] = file.summary;
+      item["tags"] = file.tags;
+      results_json.push_back(std::move(item));
+    }
+
+    json j;
+    j["code"] = 0;
+    j["message"] = "search success";
+    j["results"] = results_json;
+    j["total"] = static_cast<int>(results_json.size());
+    resp.contentType = "application/json";
+    resp.body = j.dump();
+  }
+
+  // ─── Agent 对话 ──────────────────────────────────
+
+  // POST /api/agent/chat
+  void handleAgentChat(const HttpRequest &req, HttpResponse &resp)
+  {
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return;
+
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
+
+    std::string message = (*json_body)["message"].get<std::string>();
+    if (message.empty())
+    {
+      makeJsonResponse(resp, 400, "message is required");
+      return;
+    }
+
+    if (!g_agent_engine.initialized())
+    {
+      makeJsonResponse(resp, 503, "Agent engine not initialized");
+      return;
+    }
+
+    auto response = g_agent_engine.chat(message, user_id);
+
+    json j;
+    j["code"] = 0;
+    j["message"] = "success";
+    j["response"] = response;
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // ─── Admin ─────────────────────────────────────────
 
-  // 检查当前用户是否为 admin
-  bool requireAdmin(const HttpRequestPtr &req,
-                    std::function<void(const HttpResponsePtr &)> &callback)
+  bool requireAdmin(const HttpRequest &req, HttpResponse &resp)
   {
-    std::int64_t user_id = requireAuth(req, callback);
-    if (user_id == 0) return false;
+    std::int64_t user_id = requireAuth(req, resp);
+    if (user_id == 0)
+      return false;
 
     UserDao user_dao;
     auto user = user_dao.findById(user_id);
     if (!user.has_value() || !user->is_admin)
     {
-      callback(makeJsonResponse(403, "admin access required"));
+      makeJsonResponse(resp, 403, "admin access required");
       return false;
     }
     return true;
   }
 
   // GET /api/admin/users
-  void handleAdminUsers(const HttpRequestPtr &req,
-                        std::function<void(const HttpResponsePtr &)> &&callback)
+  void handleAdminUsers(const HttpRequest &req, HttpResponse &resp)
   {
-    if (!requireAdmin(req, callback)) return;
+    if (!requireAdmin(req, resp))
+      return;
 
     int limit = 20, offset = 0;
-    auto lp = req->getParameter("limit");
-    auto op = req->getParameter("offset");
-    if (!lp.empty()) limit = std::stoi(lp);
-    if (!op.empty()) offset = std::stoi(op);
+    auto limit_str = req.getQuery("limit");
+    auto offset_str = req.getQuery("offset");
+    if (!limit_str.empty())
+      limit = std::stoi(limit_str);
+    if (!offset_str.empty())
+      offset = std::stoi(offset_str);
 
     UserDao user_dao;
     auto users = user_dao.listAll(limit, offset);
     auto total = user_dao.countAll();
 
-    Json::Value users_json(Json::arrayValue);
+    json users_json = json::array();
     for (const auto &u : users)
     {
-      Json::Value item;
+      json item;
       item["id"] = u.id;
       item["username"] = u.username;
       item["email"] = u.email;
       item["status"] = u.status;
       item["is_admin"] = u.is_admin;
       item["created_at"] = u.created_at;
-      users_json.append(item);
+      users_json.push_back(item);
     }
 
-    Json::Value resp_json;
-    resp_json["code"] = 0;
-    resp_json["users"] = users_json;
-    resp_json["total"] = static_cast<Json::Int64>(total);
+    json j;
+    j["code"] = 0;
+    j["users"] = users_json;
+    j["total"] = static_cast<int64_t>(total);
 
-    auto resp = HttpResponse::newHttpResponse();
-    resp->setStatusCode(k200OK);
-    resp->setContentTypeCode(CT_APPLICATION_JSON);
-    resp->setBody(Json::writeString(Json::StreamWriterBuilder(), resp_json));
-    callback(resp);
+    resp.contentType = "application/json";
+    resp.body = j.dump();
   }
 
   // PATCH /api/admin/users/{userId}/status
-  void handleAdminSetStatus(const HttpRequestPtr &req,
-                            std::function<void(const HttpResponsePtr &)> &&callback,
-                            const std::string &userIdStr)
+  void handleAdminSetStatus(const HttpRequest &req, HttpResponse &resp)
   {
-    if (!requireAdmin(req, callback)) return;
+    if (!requireAdmin(req, resp))
+      return;
 
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
+    std::string userIdStr = req.getParam("userId");
     std::int64_t user_id = std::stoll(userIdStr);
-    int status = (*json)["status"].asInt();
+    int status = (*json_body)["status"].get<int>();
 
     UserDao user_dao;
     if (!user_dao.updateStatus(user_id, status))
     {
-      callback(makeJsonResponse(500, "failed to update status"));
+      makeJsonResponse(resp, 500, "failed to update status");
       return;
     }
-    callback(makeJsonResponse(0, "status updated"));
+    makeJsonResponse(resp, 0, "status updated");
   }
 
   // PATCH /api/admin/users/{userId}/admin
-  void handleAdminSetAdmin(const HttpRequestPtr &req,
-                           std::function<void(const HttpResponsePtr &)> &&callback,
-                           const std::string &userIdStr)
+  void handleAdminSetAdmin(const HttpRequest &req, HttpResponse &resp)
   {
-    if (!requireAdmin(req, callback)) return;
+    if (!requireAdmin(req, resp))
+      return;
 
-    const Json::Value *json = requireJsonBody(req, callback);
-    if (!json) return;
+    const json *json_body = requireJsonBody(req, resp);
+    if (!json_body)
+      return;
 
+    std::string userIdStr = req.getParam("userId");
     std::int64_t user_id = std::stoll(userIdStr);
-    bool is_admin = (*json)["is_admin"].asBool();
+    bool is_admin = (*json_body)["is_admin"].get<bool>();
 
-    // 直接执行 SQL 设置 is_admin
     auto conn = ConnectionPool::instance().getConnection();
     if (!conn)
     {
-      callback(makeJsonResponse(500, "database error"));
+      makeJsonResponse(resp, 500, "database error");
       return;
     }
     std::string sql = "UPDATE users SET is_admin = " + std::to_string(is_admin ? 1 : 0) +
                       ", updated_at = NOW() WHERE id = " + std::to_string(user_id);
     if (!conn->update(sql))
     {
-      callback(makeJsonResponse(500, "failed to update admin status"));
+      makeJsonResponse(resp, 500, "failed to update admin status");
       return;
     }
-    callback(makeJsonResponse(0, "admin status updated"));
+    makeJsonResponse(resp, 0, "admin status updated");
   }
 
 } // anonymous namespace
@@ -1075,7 +1527,6 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  // 验证配置
   if (!app_config.validate())
   {
     logError("Configuration validation failed");
@@ -1095,74 +1546,160 @@ int main(int argc, char *argv[])
   g_llm_service->init(app_config.llm.provider,
                       app_config.llm.api_key,
                       app_config.llm.api_base,
-                      app_config.llm.model);
+                      app_config.llm.model,
+                      app_config.llm.embedding_model);
+
+  // 初始化 Agent 引擎
+  if (g_llm_service->initialized())
+  {
+    auto llm = g_llm_service->getLLM();
+    if (llm)
+    {
+      g_agent_engine.init(llm, g_vector_store);
+      if (g_agent_engine.initialized())
+        logInfo("AgentEngine initialized");
+      else
+        logWarn("AgentEngine init failed");
+    }
+  }
+
+  // 初始化存储后端（FastDFS）
+  if (app_config.storage.type == "fastdfs")
+  {
+    auto fdfs = std::make_unique<FastDfsClient>();
+    if (fdfs->init(app_config.storage.fastdfs_conf))
+    {
+      g_fastdfs = std::move(fdfs);
+      g_fastdfs_data_path = app_config.storage.fastdfs_data_path;
+      logInfo("Storage backend: FastDFS (" + app_config.storage.fastdfs_conf + ")");
+      if (!g_fastdfs_data_path.empty())
+        logInfo("FastDFS X-Accel-Redirect data path: " + g_fastdfs_data_path);
+    }
+    else
+    {
+      logError("FastDFS init failed, falling back to local storage");
+    }
+  }
+  else
+  {
+    logInfo("Storage backend: local disk");
+  }
 
   logInfo("Configuration loaded and validated");
   logDebug(app_config.toString());
   logInfo("MySQL pool initialized: available=" + std::to_string(ConnectionPool::instance().available()) +
           ", active=" + std::to_string(ConnectionPool::instance().active()));
 
-  // ─── HTTP 服务 ─────────────────────────────────
+  // ─── HTTP 服务（FastCGI）─────────────────────────
 
-  // 确保上传目录存在
   ensureDirectory("uploads");
-  std::cout << R"(
-    ┌─────────────────────────────────────────┐
-    │        FileAgent Server                 │
-    │   C++20  AI 智能文件管理服务             │
-    │   Drogon (epoll) + MySQL + llama.cpp    │
-    └─────────────────────────────────────────┘
-    )" << std::endl;
 
-  logInfo("Starting server on " + app_config.server.host + ":" + std::to_string(app_config.server.port));
+  logInfo("Starting FastCGI server");
   logInfo("Database: " + app_config.database.host + ":" + std::to_string(app_config.database.port) +
           "/" + app_config.database.database);
-  logInfo("Thread count: " + std::to_string(app_config.server.threads));
 
-  // 注册全局认证中间件
-  // app().registerMiddleware(std::make_shared<AuthMiddleware>());
+  FastCgiServer server;
 
   // ─── 注册全部路由 ──────────────────────────────
 
   // 公共路由
-  app().registerHandler("/health", &handleHealth, {Get});
-  app().registerHandler("/api/user/register", &handleRegister, {Post});
-  app().registerHandler("/api/user/login", &handleLogin, {Post});
+  server.get("/health", handleHealth);
+  server.post("/api/user/register", handleRegister);
+  server.post("/api/user/login", handleLogin);
 
   // 受保护路由
-  app().registerHandler("/api/user/logout", &handleLogout, {Post});
+  server.post("/api/user/logout", handleLogout);
 
-  // 分片上传路由（需在 /api/files/upload 之前注册，否则被泛匹配截获）
-  app().registerHandler("/api/files/upload/init", &handleChunkInit, {Post});
-  // 必须比 /{chunkIndex} 先注册，否则 complete/status 会被参数化路由吃掉
-  app().registerHandler("/api/files/upload/{uploadId}/complete", &handleChunkComplete, {Post});
-  app().registerHandler("/api/files/upload/{uploadId}/status", &handleChunkStatus, {Get});
-  app().registerHandler("/api/files/upload/{uploadId}/{chunkIndex}", &handleChunkUpload, {Post});
+  // 文件秒传确认（不需认证）
+  server.post("/api/files/check", handleFileCheck);
 
-  app().registerHandler("/api/files/upload", &handleUpload, {Post});
-  app().registerHandler("/api/files", &handleListFiles, {Get});
-  app().registerHandler("/api/files/{fileId}", &handleDownload, {Get});
-  app().registerHandler("/api/files/{fileId}", &handleDelete, {Delete});
+  // 分片上传路由（需在 /api/files/upload 之前注册）
+  server.post("/api/files/upload/init", handleChunkInit);
+  server.post("/api/files/upload/{uploadId}/complete", handleChunkComplete);
+  server.get("/api/files/upload/{uploadId}/status", handleChunkStatus);
+  server.post("/api/files/upload/{uploadId}/{chunkIndex}", handleChunkUpload);
 
-  // ─── 分享链接路由 ──────────────────────────────
-  // 访问分享是公开接口
-  app().registerHandler("/api/shares/{token}", &handleShareAccess, {Get});
-  // 其余需认证
-  app().registerHandler("/api/shares", &handleShareCreate, {Post});
-  app().registerHandler("/api/shares", &handleShareList, {Get});
-  app().registerHandler("/api/shares/{token}", &handleShareDelete, {Delete});
+  // 文件路由
+  server.post("/api/files/upload", handleUpload);
+  server.get("/api/files", handleListFiles);
+  server.get("/api/files/{fileId}", handleDownload);
+  server.del("/api/files/{fileId}", handleDelete);
 
-  // ─── LLM 路由 ──────────────────────────────────
-  app().registerHandler("/api/llm/chat", &handleLlmChat, {Post});
-  app().registerHandler("/api/llm/analyze", &handleLlmAnalyze, {Post});
+  // 分享链接
+  server.get("/api/shares/{token}", [](const HttpRequest &req, HttpResponse &resp)
+             {
+        std::string token = req.getParam("token");
 
-  // ─── Admin 路由 ─────────────────────────────────
-  app().registerHandler("/api/admin/users", &handleAdminUsers, {Get});
-  app().registerHandler("/api/admin/users/{userId}/status", &handleAdminSetStatus, {Patch});
-  app().registerHandler("/api/admin/users/{userId}/admin", &handleAdminSetAdmin, {Patch});
+        ShareDao share_dao;
+        auto share = share_dao.findByToken(token);
+        if (!share.has_value())
+        {
+            makeJsonResponse(resp, 404, "share not found or expired");
+            return;
+        }
 
-  // 启动
-  app().addListener(app_config.server.host, app_config.server.port).setThreadNum(static_cast<unsigned int>(app_config.server.threads)).run();
+        FileService file_service;
+        auto file_result = file_service.getFileById(share->file_id);
+        if (!file_result.success)
+        {
+            makeJsonResponse(resp, 404, "file not found");
+            return;
+        }
+
+        auto &file = *file_result.data;
+
+        // FastDFS + X-Accel-Redirect（如果配置了）
+        if (isFastDfsPath(file.storage_path) && !g_fastdfs_data_path.empty())
+        {
+            std::string redirect_url = toFastDfsRedirectUrl(file.storage_path);
+            if (!redirect_url.empty())
+            {
+                resp.setHeader("X-Accel-Redirect", redirect_url);
+                resp.setHeader("Content-Disposition",
+                                "attachment; filename=\"" + file.filename + "\"");
+                return;
+            }
+        }
+
+        std::string file_content;
+        if (!retrieveFile(file.storage_path, file_content))
+        {
+            makeJsonResponse(resp, 404, "file not found");
+            return;
+        }
+
+        resp.body = std::move(file_content);
+        resp.contentType = "application/octet-stream";
+        resp.setHeader("Content-Disposition",
+                        "attachment; filename=\"" + file.filename + "\""); });
+
+  // 其余分享路由需认证
+  server.post("/api/shares", handleShareCreate);
+  server.get("/api/shares", handleShareList);
+  server.del("/api/shares/{token}", handleShareDelete);
+  server.post("/api/shares/{token}/save", handleShareSave);
+  server.get("/api/shares/ranking", handleShareRanking);
+
+  // LLM 路由
+  server.post("/api/llm/chat", handleLlmChat);
+  server.post("/api/llm/analyze", handleLlmAnalyze);
+
+  // 语义搜索
+  server.post("/api/search", handleSearch);
+
+  // Agent 对话
+  server.post("/api/agent/chat", handleAgentChat);
+
+  // Admin 路由
+  server.get("/api/admin/users", handleAdminUsers);
+  server.patch("/api/admin/users/{userId}/status", handleAdminSetStatus);
+  server.patch("/api/admin/users/{userId}/admin", handleAdminSetAdmin);
+
+  // ─── 启动主循环 ────────────────────────────────
+  // FastCGI 监听端口（也可以改为文件 socket，如 /var/run/fileagent.sock）
+  std::string listen_port = ":" + std::to_string(app_config.server.port);
+  server.setSocketPath(listen_port);
+  server.run();
 
   return 0;
 }

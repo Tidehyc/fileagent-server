@@ -59,6 +59,14 @@ namespace fileagent
         LruCacheConfig lru;
     };
 
+    // 存储配置
+    struct StorageConfig
+    {
+        std::string type = "local"; // "local" 或 "fastdfs"
+        std::string fastdfs_conf = "/etc/fdfs/client.conf"; // FastDFS client.conf 路径
+        std::string fastdfs_data_path = ""; // FastDFS 数据目录（Nginx X-Accel-Redirect 用）
+    };
+
     // LLM 配置
     struct LlmConfig
     {
@@ -66,6 +74,7 @@ namespace fileagent
         std::string api_key;                 // 云端 API Key（openai/anthropic/google）
         std::string api_base;                 // 自定义 API 地址（可选）
         std::string model = "llama3.2";       // 模型名（按 provider 不同）
+        std::string embedding_model;          // Embedding 模型名（如 "nomic-embed-text"，空则用 model）
         std::string model_path;               // 本地 GGUF 路径（provider=local 时使用）
         int num_threads = 4;
         int context_window = 2048;
@@ -77,6 +86,7 @@ namespace fileagent
         ServerConfig server;
         DatabaseConfig database;
         CacheConfig cache;
+        StorageConfig storage;
         LlmConfig llm;
 
         // 从配置文件加载

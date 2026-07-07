@@ -1,6 +1,7 @@
 #include "UserDao.h"
 
 #include "../db/ConnectionPool.h"
+#include "../db/PreparedStatement.h"
 #include "../db/MysqlConn.h"
 
 namespace fileagent
@@ -57,12 +58,25 @@ namespace fileagent
         auto connection = ConnectionPool::instance().getConnection();
         if (!connection) return std::nullopt;
 
-        std::string sql = "SELECT id, username, password, email, status, is_admin, created_at, updated_at FROM users WHERE username = '" +
-                          connection->escape(username) + "' LIMIT 1";
-        if (!connection->query(sql) || !connection->next())
+        // 使用 Prepared Statement（替代 escape() 拼接）
+        PreparedStatement stmt(connection->raw());
+        if (!stmt.prepare("SELECT id, username, password, email, status, is_admin, created_at, updated_at FROM users WHERE username = ? LIMIT 1"))
             return std::nullopt;
 
-        return makeUserRecord(connection);
+        stmt.bindString(0, username);
+        if (!stmt.execute() || !stmt.fetch())
+            return std::nullopt;
+
+        UserRecord record;
+        record.id = stmt.getInt64(0);
+        record.username = stmt.getString(1);
+        record.password = stmt.getString(2);
+        record.email = stmt.getString(3);
+        record.status = std::stoi(stmt.getString(4));
+        record.is_admin = stmt.getString(5) == "1";
+        record.created_at = stmt.getString(6);
+        record.updated_at = stmt.getString(7);
+        return record;
     }
 
     bool UserDao::updateStatus(std::int64_t id, int status)

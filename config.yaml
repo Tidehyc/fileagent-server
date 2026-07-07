@@ -27,11 +27,18 @@ cache:
   lru:
     capacity: 10000
 
+# 存储配置（目前使用 fastdfs）
+storage:
+  type: "fastdfs"                   # "local" 或 "fastdfs"
+  fastdfs_conf: "/etc/fdfs/client.conf"  # FastDFS 客户端配置
+  fastdfs_data_path: "/home/tide/fastdfs/storage/data"  # Nginx X-Accel-Redirect 的本地路径
+
 llm:
   provider: "ollama"           # "ollama" / "openai" / "anthropic" / "google" / "local"
   api_key: "sk-your-key-here"  # 云端 API Key（openai/anthropic/google 使用）
   api_base: "http://localhost:11434/api"  # Ollama 地址或自定义代理
   model: "llama3.2"            # 模型名（按 provider 不同）
+  embedding_model: "nomic-embed-text"  # Embedding 模型（空则用 model）
   model_path: "/models/llama-2-7b.Q4_K_M.gguf"  # 本地 GGUF 路径（provider=local 时使用）
   num_threads: 4
   context_window: 2048

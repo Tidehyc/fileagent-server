@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: fileagent
+      MYSQL_USER: fileagent
+      MYSQL_PASSWORD: fileagent123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - fileagent-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - fileagent-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fileagent:
+    build: .
+    ports:
+      - "80:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: fileagent
+      DB_PASSWORD: fileagent123
+      DB_NAME: fileagent
+      REDIS_HOST: redis
+    volumes:
+      - file_storage:/data/uploads
+    networks:
+      - fileagent-net
+
+volumes:
+  mysql_data:
+  redis_data:
+  file_storage:
+
+networks:
+  fileagent-net:
+    driver: bridge

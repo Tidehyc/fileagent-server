@@ -20,6 +20,11 @@ namespace fileagent
 
         bool updateStatus(std::int64_t id, int status);
         bool removeById(std::int64_t id);
+
+        /// 更新文件摘要和标签（AI 生成）
+        bool updateFileMeta(std::int64_t id,
+                            const std::string &summary,
+                            const std::string &tags);
     };
 
 } // namespace fileagent

@@ -70,6 +70,15 @@ namespace fileagent
                 }
             }
 
+            // 加载存储配置
+            if (config["storage"])
+            {
+                YAML::Node st = config["storage"];
+                storage.type = st["type"].as<std::string>(storage.type);
+                storage.fastdfs_conf = st["fastdfs_conf"].as<std::string>(storage.fastdfs_conf);
+                storage.fastdfs_data_path = st["fastdfs_data_path"].as<std::string>(storage.fastdfs_data_path);
+            }
+
             // 加载 LLM 配置
             if (config["llm"])
             {
@@ -78,6 +87,7 @@ namespace fileagent
                 llm.api_key = llm_cfg["api_key"].as<std::string>(llm.api_key);
                 llm.api_base = llm_cfg["api_base"].as<std::string>(llm.api_base);
                 llm.model = llm_cfg["model"].as<std::string>(llm.model);
+                llm.embedding_model = llm_cfg["embedding_model"].as<std::string>("");
                 llm.model_path = llm_cfg["model_path"].as<std::string>("");
                 llm.num_threads = llm_cfg["num_threads"].as<int>(llm.num_threads);
                 llm.context_window = llm_cfg["context_window"].as<int>(llm.context_window);
@@ -166,7 +176,9 @@ namespace fileagent
         }
 
         ss << "\n"
+           << "  Storage: type=" << storage.type << ", conf=" << storage.fastdfs_conf << "\n"
            << "  LLM: provider=" << llm.provider << ", model=" << llm.model
+           << ", embedding_model=" << (llm.embedding_model.empty() ? "none" : llm.embedding_model)
            << ", api_base=" << llm.api_base << ", model_path=" << llm.model_path << "\n"
            << "}";
 

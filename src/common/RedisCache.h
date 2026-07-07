@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <hiredis/hiredis.h>
 
@@ -33,6 +35,11 @@ namespace fileagent
         bool del(const std::string &key);
         bool exists(const std::string &key);
         bool isConnected() const;
+
+        // ZSET 操作（排行榜用）
+        bool zincrby(const std::string &key, const std::string &member, double increment = 1.0);
+        /// 获取 ZSET 排名（高→低），返回 (member, score) 列表
+        std::vector<std::pair<std::string, double>> zrevrange(const std::string &key, int start = 0, int stop = -1);
 
     private:
         bool reconnect();

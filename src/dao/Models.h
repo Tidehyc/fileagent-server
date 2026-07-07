@@ -46,6 +46,8 @@ namespace fileagent
         std::int64_t file_size{0};
         std::string storage_path;
         int status{0};
+        std::string summary;        // AI 生成的摘要
+        std::string tags;           // AI 生成的标签（逗号分隔）
         std::string created_at;
     };
 

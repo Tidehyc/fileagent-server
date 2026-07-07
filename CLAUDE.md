@@ -54,44 +54,58 @@ C++20 AI 智能文件管理服务 — FastCGI + Nginx + MySQL + Redis + LLM
 
 ## 后续规划（对标工业级云存储）
 
-### Phase 1 — 架构升级（当前）
+### Phase 1 — 架构升级 ✅ Done
 
-| # | 需求 | 优先级 | 说明 |
-|---|------|--------|------|
-| 1 | Drogon → FastCGI + Nginx 迁移 | **最高** | 替换 HTTP 框架，Nginx 反向代理 |
-| 2 | 改用 OpenSSL SHA-256 | **高** | 移除 trantor 依赖 |
+| # | 需求 | 状态 | 说明 |
+|---|------|------|------|
+| 1 | Drogon → FastCGI + Nginx 迁移 | ✅ Done | Nginx 反向代理 + libfcgi |
+| 2 | 改用 OpenSSL SHA-256 | ✅ Done | 移除 trantor/OpenSSL EVP |
 
-### Phase 2 — AI 智能搜索（最大差异化）
+### Phase 1.5 — 分布式存储 ✅ Done
 
-| # | 需求 | 说明 |
-|---|------|------|
-| 3 | 文件文本提取 | TXT/PDF/代码 → 纯文本 |
-| 4 | LLM 摘要 + 标签 | 上传时自动调用 LLM 生成文件摘要和标签 |
-| 5 | 语义搜索 API | `POST /api/search?q="..."` 自然语言搜文件 |
-| 6 | 搜索结果入库 | 摘要/标签持久化到 MySQL |
+| # | 需求 | 状态 | 说明 |
+|---|------|------|------|
+| 3 | FastDFS 集成 | ✅ Done | Tracker + Storage 架构，替换本地磁盘 |
+| 4 | FastDFS 客户端 SDK | ✅ Done | C++ 封装 FastDfsClient，上传/下载/删除 |
+| 5 | Nginx + FastDFS 整合 | ✅ Done | X-Accel-Redirect，handler 认证后 Nginx 直接服文件 |
+| 6 | 本地文件迁移脚本 | ✅ Done | `scripts/migrate_to_fastdfs.sh`，9 个文件已迁移 |
 
-### Phase 3 — 功能补齐
+> 新文件存储在 FastDFS（file_id = `group1/M00/00/00/xxx`），旧文件仍保留在本地 `uploads/{hash_prefix}/{full_hash}`。`storage_path` 字段根据路径前缀自动判断后端：以 `group` 开头则走 FastDFS，否则走本地磁盘。`config.yaml` 中 `storage.type: fastdfs` 可切换回 `local`。
 
-| # | 需求 | 说明 |
-|---|------|------|
-| 7 | 转存文件 | 分享 → 转存到自己名下 |
-| 8 | 分享排行榜 | Redis ZSET 维护热门分享 |
-| 9 | 文件秒传确认 | 当前已有哈希去重，对标 MD5 秒传 |
+### Phase 2 — AI 智能搜索 ✅ Done
 
-### Phase 4 — 部署与质量
+| # | 需求 | 状态 | 说明 |
+|---|------|------|------|
+| 7 | 文件文本提取 | ✅ Done | `TextExtractor` — TXT/PDF/代码 → 纯文本（pdftotext） |
+| 8 | LLM 摘要 + 标签 | ✅ Done | 上传时自动调用 LLM 生成摘要/标签，更新 DB |
+| 9 | 语义搜索 API | ✅ Done | `POST /api/search` — 向量 Embedding + 余弦相似度 Top-K |
+| 10 | 搜索结果入库 | ✅ Done | summary/tags 持久化到 files 表 + VectorStore 内存索引 |
 
-| # | 需求 | 说明 |
-|---|------|------|
-| 10 | 单元测试 | Google Test |
-| 11 | Rate limiting | 防暴力破解 |
-| 12 | Prepared Statement | `escape()` → 参数化查询 |
-| 13 | Docker + K8s | 一键部署 |
+> 向量检索基于 Ollama Embedding API（`nomic-embed-text`） + 自实现 `VectorStore`（余弦相似度暴力搜索）。  
+> Agent 引擎基于 agents-cpp 的 `LLMInterface::chatWithTools()`，注册 4 个工具（semantic_search / get_file_info / list_files / summarize_file）。
+
+### Phase 3 — 功能补齐 ✅ Done
+
+| # | 需求 | 状态 | 说明 |
+|---|------|------|------|
+| 11 | 转存文件 | ✅ Done | `POST /api/shares/{token}/save` — 分享 → 转存到自己名下 |
+| 12 | 分享排行榜 | ✅ Done | `GET /api/shares/ranking` — SQL 统计分享次数 Top-N |
+| 13 | 文件秒传确认 | ✅ Done | `POST /api/files/check` — SHA-256 预检，存在则返回 file_id |
+
+### Phase 4 — 部署与质量 ✅ Done
+
+| # | 需求 | 状态 | 说明 |
+|---|------|------|------|
+| 14 | 单元测试 | ✅ Done | Google Test + 25 tests（TextExtractor/VectorStore/TextChunker） |
+| 15 | Rate limiting | ✅ Done | 滑动窗口限流器，注册/登录 10 次/分钟/IP |
+| 16 | Prepared Statement | ✅ Done | PreparedStatement RAII 封装 + UserDao 演示迁移 |
+| 17 | Docker + K8s | ✅ Done | Dockerfile 多阶段构建 + docker-compose.yml |
 
 ---
 
 ## 项目进度
 
-### 当前状态：MVP 完成，准备架构升级
+### 当前状态：FastCGI + Nginx 架构升级完成
 
 ```
 业务逻辑层 ██████████████████ 100%
@@ -100,31 +114,32 @@ C++20 AI 智能文件管理服务 — FastCGI + Nginx + MySQL + Redis + LLM
   ├─ 缓存层 (LRU/Redis)                 ████████████ 100%
   └─ LLM 集成 (4 provider)              ████████████ 100%
 
-HTTP 层    ████████░░░░░░░░ 40%（准备迁移到 FastCGI）
-  ├─ 业务逻辑 handler                     ████████████ 100% (待迁移)
-  └─ HTTP 框架                           ░░░░░░░░░░░░   0% (Drogon→FastCGI)
+HTTP 层    ██████████████████ 100%
+  ├─ 业务逻辑 handler                     ████████████ 100%
+  └─ HTTP 框架 (FastCGI + Nginx)         ████████████ 100%
 
-部署层     ░░░░░░░░░░░░░░░░ 0%
-  ├─ Nginx                               ░░░░░░░░░░░░   0%
+部署层     ████░░░░░░░░░░░░ 15%
+  ├─ Nginx                               ████████████ 100%
   ├─ Docker                              ░░░░░░░░░░░░   0%
   └─ K8s                                 ░░░░░░░░░░░░   0%
+
+AI 层      ██████████████████ 100%
+  ├─ 文本提取 (TextExtractor)           ████████████ 100%
+  ├─ 向量索引 (VectorStore)             ████████████ 100%
+  ├─ 语义搜索 (Embedding + /api/search) ████████████ 100%
+  ├─ 摘要标签 (LLM 自动生成)            ████████████ 100%
+  └─ Agent 引擎 (4 tools)               ████████████ 100%
 ```
 
 ---
 
 ## 架构说明
 
-### 当前架构（迁移前）
-
-```
-客户端 → Drogon (端口 10086, 自包含 HTTP 框架)
-```
-
-### 目标架构（迁移后）
+### 当前架构
 
 ```
 客户端 → Nginx (端口 80, 反向代理)
-              ├── /api/* → FastCGI → fileagent-server (Unix Socket)
+              ├── /api/* → FastCGI → fileagent-server (TCP :10086)
               ├── /health → FastCGI → fileagent-server
               └── /uploads/* → Nginx 直接返回静态文件
 ```
@@ -177,15 +192,21 @@ config.yaml → AppConfig → ConnectionPool.init()
 │   └── init.sql            数据库初始化 DDL
 ├── src/
 │   ├── main.cpp            入口：加载配置 → 初始化 → FastCGI 主循环
+│   ├── agent/
+│   │   └── AgentEngine.h/cpp  ReAct Loop + 工具注册（基于 agents-cpp）
 │   ├── common/
 │   │   ├── Config.h        AppConfig 及其子结构体
 │   │   ├── ConfigLoader.h/cpp YAML 解析 + 校验
 │   │   ├── Hash.h/cpp      bcrypt 密码哈希 + 令牌生成
 │   │   ├── Sha256.h/cpp    OpenSSL SHA-256 封装
+│   │   ├── TextExtractor.h/cpp 文件文本提取（TXT/PDF/代码）
 │   │   ├── Logger.h        内联日志
 │   │   ├── StringUtil.h    trimCopy / jsonEscape
 │   │   ├── Types.h         ApiResponse
 │   │   ├── CacheInterface.h / CacheManager.h/cpp / LruCache.h / RedisCache.h/cpp
+│   ├── vector/
+│   │   ├── VectorStore.h/cpp   内存向量索引 + 余弦相似度 Top-K
+│   │   └── TextChunker.h/cpp   文档分块器（滑动窗口 / 按段落）
 │   ├── db/
 │   │   ├── MysqlConn.h/cpp MySQL C API 封装
 │   │   └── ConnectionPool.h/cpp 连接池
@@ -216,6 +237,7 @@ config.yaml → AppConfig → ConnectionPool.init()
 | LLM | agents.cpp-main | ollama / openai / anthropic / google |
 | 构建 | CMake 3.20+ | vcpkg |
 | 配置 | YAML | yaml-cpp |
+| JSON | nlohmann-json | 替代 jsoncpp |
 | 哈希 | bcrypt (密码) + OpenSSL SHA-256 (文件) | |
 
 ---
@@ -263,11 +285,13 @@ curl http://localhost/health
 
 ### 依赖
 - yaml-cpp（vcpkg）
+- nlohmann-json（vcpkg，header-only）
 - MySQL 客户端库（系统: `libmysqlclient-dev`）
 - hiredis（系统: `libhiredis-dev`）
 - OpenSSL（vcpkg: `openssl`）
 - FastCGI（系统: `libfcgi-dev`）
 - Nginx（系统: `nginx`）
+- FastDFS（系统: `libfdfsclient-dev`，或源码编译）
 - agents.cpp-main（外部，链接 `.so`）
 
 ---

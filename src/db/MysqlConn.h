@@ -32,6 +32,7 @@ namespace fileagent
         bool rollback();
 
         std::string escape(const std::string &text) const;
+        MYSQL *raw() { return connection_; }
 
         void refreshAliveTime();
         long long getAliveTime() const;
