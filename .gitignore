@@ -13,4 +13,4 @@ uploads/tmp/
 *.dylib
 *.dll
 *.exe
-compile_commands.json
+compile_commands.json.claude/settings.local.json.tmp.*
