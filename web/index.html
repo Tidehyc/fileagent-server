@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FileAgent Server — AI 智能云存储</title>
+<link rel="stylesheet" href="/web/css/style.css">
+</head>
+<body>
+
+<!-- 导航栏 -->
+<nav class="navbar" id="navbar" style="display:none">
+  <a href="#dashboard" class="brand">FileAgent</a>
+  <a href="#dashboard" class="nav-link" data-page="dashboard">文件</a>
+  <a href="#search" class="nav-link" data-page="search">搜索</a>
+  <a href="#shares" class="nav-link" data-page="shares">分享</a>
+  <a href="#agent" class="nav-link" data-page="agent">AI 助手</a>
+  <div class="right">
+    <span id="userInfo" style="font-size:13px;color:#64748b"></span>
+    <button class="btn btn-outline btn-sm" onclick="API.clearToken(); showPage('login')">退出</button>
+  </div>
+</nav>
+
+<!-- 容器 -->
+<div class="container" id="app"></div>
+
+<script src="/web/js/api.js"></script>
+<script>
+// ─── 页面路由 ──────────────────────────────────────
+
+const PAGES = {};
+
+function showPage(name, data) {
+  // 隐藏/显示导航栏
+  document.getElementById('navbar').style.display =
+    (name === 'login' || name === 'register') ? 'none' : 'flex';
+
+  // 高亮当前导航
+  document.querySelectorAll('.nav-link').forEach(el => {
+    el.classList.toggle('active', el.dataset.page === name);
+  });
+
+  // 更新用户信息
+  if (API.isLoggedIn()) {
+    document.getElementById('userInfo').textContent = localStorage.getItem('username') || '';
+  }
+
+  if (PAGES[name]) {
+    PAGES[name](data);
+  }
+}
+
+// 路由监听
+window.addEventListener('hashchange', () => {
+  const page = location.hash.slice(1) || 'login';
+  if (!API.isLoggedIn() && page !== 'register') {
+    showPage('login');
+  } else {
+    showPage(page);
+  }
+});
+
+// ─── 页面：登录 ────────────────────────────────────
+
+PAGES.login = function() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div style="max-width:400px;margin:80px auto">
+      <div class="card">
+        <h2 style="text-align:center;color:var(--primary)">FileAgent Server</h2>
+        <p style="text-align:center;font-size:13px;color:var(--text-secondary);margin-bottom:20px">AI 智能云存储</p>
+        <div id="loginMsg"></div>
+        <div class="form-group">
+          <label>用户名</label>
+          <input type="text" id="loginUser" placeholder="username">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" id="loginPass" placeholder="password" onkeydown="if(event.key==='Enter') doLogin()">
+        </div>
+        <button class="btn btn-primary" style="width:100%" onclick="doLogin()">登录</button>
+        <p style="text-align:center;margin-top:12px;font-size:13px">
+          没有账号？<a href="#register" style="color:var(--primary)">注册</a>
+        </p>
+      </div>
+    </div>
+  `;
+  document.getElementById('loginUser').focus();
+};
+
+async function doLogin() {
+  const user = document.getElementById('loginUser').value.trim();
+  const pass = document.getElementById('loginPass').value;
+  if (!user || !pass) { showMsg('loginMsg', '请输入用户名和密码', 'error'); return; }
+  try {
+    const data = await API.login(user, pass);
+    localStorage.setItem('username', user);
+    showMsg('loginMsg', '登录成功', 'success');
+    setTimeout(() => location.hash = 'dashboard', 300);
+  } catch (e) {
+    showMsg('loginMsg', e.message, 'error');
+  }
+}
+
+// ─── 页面：注册 ────────────────────────────────────
+
+PAGES.register = function() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div style="max-width:400px;margin:80px auto">
+      <div class="card">
+        <h2 style="text-align:center">注册账号</h2>
+        <div id="regMsg"></div>
+        <div class="form-group">
+          <label>用户名</label>
+          <input type="text" id="regUser" placeholder="username">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" id="regPass" placeholder="password">
+        </div>
+        <div class="form-group">
+          <label>邮箱</label>
+          <input type="email" id="regEmail" placeholder="email@example.com">
+        </div>
+        <button class="btn btn-primary" style="width:100%" onclick="doRegister()">注册</button>
+        <p style="text-align:center;margin-top:12px;font-size:13px">
+          已有账号？<a href="#login" style="color:var(--primary)">登录</a>
+        </p>
+      </div>
+    </div>
+  `;
+};
+
+async function doRegister() {
+  const user = document.getElementById('regUser').value.trim();
+  const pass = document.getElementById('regPass').value;
+  const email = document.getElementById('regEmail').value.trim();
+  if (!user || !pass) { showMsg('regMsg', '请填写用户名和密码', 'error'); return; }
+  try {
+    await API.register(user, pass, email || user + '@fileagent');
+    showMsg('regMsg', '注册成功！请登录', 'success');
+    setTimeout(() => location.hash = 'login', 1000);
+  } catch (e) {
+    showMsg('regMsg', e.message, 'error');
+  }
+}
+
+// ─── 页面：文件管理 ────────────────────────────────
+
+PAGES.dashboard = function() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="stats">
+      <div class="stat-card"><div class="number" id="fileCount">-</div><div class="label">文件数</div></div>
+      <div class="stat-card"><div class="number" id="totalSize">-</div><div class="label">总大小</div></div>
+    </div>
+    <div class="card">
+      <h2>上传文件</h2>
+      <div id="uploadMsg"></div>
+      <div class="upload-area" id="uploadArea">
+        <div style="font-size:32px;margin-bottom:8px">📁</div>
+        <p style="color:var(--text-secondary)">点击或拖拽文件到此处上传</p>
+        <input type="file" id="fileInput" style="display:none">
+      </div>
+    </div>
+    <div class="card">
+      <h2>文件列表</h2>
+      <div id="fileListMsg"></div>
+      <div id="fileList"><p class="empty">加载中...</p></div>
+    </div>
+  `;
+  loadFiles();
+
+  // 上传交互
+  const area = document.getElementById('uploadArea');
+  const input = document.getElementById('fileInput');
+  area.onclick = () => input.click();
+  area.ondragover = (e) => { e.preventDefault(); area.classList.add('dragover'); };
+  area.ondragleave = () => area.classList.remove('dragover');
+  area.ondrop = (e) => { e.preventDefault(); area.classList.remove('dragover'); if (e.dataTransfer.files[0]) doUpload(e.dataTransfer.files[0]); };
+  input.onchange = () => { if (input.files[0]) doUpload(input.files[0]); };
+};
+
+async function loadFiles() {
+  try {
+    const data = await API.listFiles(100, 0);
+    const files = data.files || [];
+    const list = document.getElementById('fileList');
+    const count = document.getElementById('fileCount');
+    const total = document.getElementById('totalSize');
+
+    count.textContent = files.length;
+    let totalBytes = 0;
+    files.forEach(f => totalBytes += (f.file_size || 0));
+    total.textContent = API.formatSize(totalBytes);
+
+    if (files.length === 0) {
+      list.innerHTML = '<p class="empty"><div class="icon">📂</div>暂无文件</p>';
+      return;
+    }
+
+    let html = '<table><thead><tr><th>文件名</th><th>大小</th><th>摘要</th><th>标签</th><th>操作</th></tr></thead><tbody>';
+    for (const f of files) {
+      const summary = f.summary ? f.summary.substring(0, 30) : '-';
+      const tags = f.tags ? f.tags.split(',').map(t => `<span class="tag">${t.trim()}</span>`).join('') : '-';
+      const url = `/api/files/${f.id}`;
+      html += `<tr>
+        <td><a href="${url}" target="_blank" style="color:var(--primary);text-decoration:none">${f.filename}</a></td>
+        <td class="file-size">${API.formatSize(f.file_size)}</td>
+        <td style="font-size:12px;color:var(--text-secondary)">${summary}</td>
+        <td>${tags}</td>
+        <td>
+          <button class="btn btn-outline btn-sm" onclick="downloadFile(${f.id})">下载</button>
+          <button class="btn btn-outline btn-sm" onclick="shareFile(${f.id})">分享</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteFile(${f.id})">删除</button>
+        </td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    html += '<p style="font-size:12px;color:var(--text-secondary);margin-top:8px">点击文件名可直接下载</p>';
+    list.innerHTML = html;
+  } catch (e) {
+    showMsg('fileListMsg', '加载失败: ' + e.message, 'error');
+  }
+}
+
+async function doUpload(file) {
+  showMsg('uploadMsg', '上传中: ' + file.name + '...', 'info');
+  try {
+    const data = await API.uploadFile(file);
+    if (data.code === 0) {
+      showMsg('uploadMsg', `上传成功！文件ID: ${data.file_id}`, 'success');
+      loadFiles();
+    } else {
+      showMsg('uploadMsg', data.message || '上传失败', 'error');
+    }
+  } catch (e) {
+    showMsg('uploadMsg', '上传失败: ' + e.message, 'error');
+  }
+}
+
+function downloadFile(id) {
+  const token = API.getToken();
+  window.open(`/api/files/${id}`, '_blank');
+}
+
+async function deleteFile(id) {
+  if (!confirm('确定删除此文件？')) return;
+  try {
+    await API.deleteFile(id);
+    loadFiles();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function shareFile(id) {
+  const hours = prompt('过期小时数（0=永不过期）:', '0');
+  if (hours === null) return;
+  try {
+    const data = await API.createShare(id, parseInt(hours) || 0);
+    const shareUrl = window.location.origin + '/api/shares/' + data.share_token;
+    alert('分享链接已创建:\n' + shareUrl);
+    API.copyToClipboard(shareUrl);
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+// ─── 页面：语义搜索 ────────────────────────────────
+
+PAGES.search = function() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="card">
+      <h2>🔍 语义搜索</h2>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">输入自然语言描述，AI 将搜索内容相关的文件</p>
+      <div id="searchMsg"></div>
+      <div class="search-box">
+        <input type="text" id="searchQuery" placeholder="例如：找一下数据库设计的文档" onkeydown="if(event.key==='Enter') doSearch()">
+        <button class="btn btn-primary" onclick="doSearch()">搜索</button>
+      </div>
+      <div id="searchResults"><p class="empty"><div class="icon">🔎</div>输入关键词开始搜索</p></div>
+    </div>
+  `;
+  document.getElementById('searchQuery').focus();
+};
+
+async function doSearch() {
+  const q = document.getElementById('searchQuery').value.trim();
+  if (!q) return;
+  showMsg('searchMsg', '搜索中...', 'info');
+  try {
+    const data = await API.search(q);
+    const results = data.results || [];
+    const div = document.getElementById('searchResults');
+    hideMsg('searchMsg');
+
+    if (results.length === 0) {
+      div.innerHTML = '<p class="empty"><div class="icon">📭</div>未找到匹配文件</p>';
+      return;
+    }
+
+    let html = `<p style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">找到 ${data.total || results.length} 个结果</p>`;
+    html += '<table><thead><tr><th>文件名</th><th>匹配度</th><th>片段</th><th>标签</th><th>操作</th></tr></thead><tbody>';
+    for (const r of results) {
+      const score = (r.score * 100).toFixed(1) + '%';
+      const snippet = r.snippet ? r.snippet.substring(0, 100) : '-';
+      const tags = r.tags ? r.tags.split(',').map(t => `<span class="tag">${t.trim()}</span>`).join('') : '-';
+      html += `<tr>
+        <td><a href="/api/files/${r.file_id}" target="_blank" style="color:var(--primary);text-decoration:none">${r.filename}</a></td>
+        <td><span style="color:${r.score > 0.7 ? 'var(--success)' : r.score > 0.4 ? 'var(--warning)' : 'var(--text-secondary)'}">${score}</span></td>
+        <td style="font-size:12px;color:var(--text-secondary);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${snippet}</td>
+        <td>${tags}</td>
+        <td><button class="btn btn-outline btn-sm" onclick="window.open('/api/files/${r.file_id}','_blank')">下载</button></td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    div.innerHTML = html;
+  } catch (e) {
+    showMsg('searchMsg', '搜索失败: ' + e.message, 'error');
+  }
+}
+
+// ─── 页面：分享管理 ────────────────────────────────
+
+PAGES.shares = function() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="card">
+      <h2>🔗 分享管理</h2>
+      <div id="shareMsg"></div>
+      <div id="shareList"><p class="empty">加载中...</p></div>
+    </div>
+    <div class="card">
+      <h2>🏆 热门分享排行</h2>
+      <div id="ranking"><p class="empty">加载中...</p></div>
+    </div>
+  `;
+  loadShares();
+  loadRanking();
+};
+
+async function loadShares() {
+  try {
+    const data = await API.listShares();
+    const shares = data.shares || [];
+    const div = document.getElementById('shareList');
+    if (shares.length === 0) {
+      div.innerHTML = '<p class="empty"><div class="icon">🔗</div>暂无分享</p>';
+      return;
+    }
+    let html = '<table><thead><tr><th>分享码</th><th>文件ID</th><th>过期时间</th><th>操作</th></tr></thead><tbody>';
+    for (const s of shares) {
+      const shareUrl = window.location.origin + '/api/shares/' + s.share_token;
+      html += `<tr>
+        <td><code style="font-size:12px">${s.share_token}</code></td>
+        <td>${s.file_id}</td>
+        <td class="file-size">${s.expires_at || '永不过期'}</td>
+        <td>
+          <button class="btn btn-outline btn-sm" onclick="API.copyToClipboard('${shareUrl}');alert('已复制')">复制链接</button>
+          <button class="btn btn-danger btn-sm" onclick="delShare('${s.share_token}')">取消</button>
+        </td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    div.innerHTML = html;
+  } catch (e) {
+    showMsg('shareMsg', '加载失败: ' + e.message, 'error');
+  }
+}
+
+async function delShare(token) {
+  if (!confirm('确定取消此分享？')) return;
+  try {
+    await API.deleteShare(token);
+    loadShares();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function loadRanking() {
+  try {
+    const data = await API.getRanking();
+    const ranks = data.ranking || [];
+    const div = document.getElementById('ranking');
+    if (ranks.length === 0) {
+      div.innerHTML = '<p class="empty"><div class="icon">🏆</div>暂无排行数据</p>';
+      return;
+    }
+    let html = '<table><thead><tr><th>#</th><th>文件名</th><th>分享次数</th></tr></thead><tbody>';
+    ranks.forEach((r, i) => {
+      html += `<tr>
+        <td><strong>${i + 1}</strong></td>
+        <td>${r.filename}</td>
+        <td>${r.share_count} 次</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    div.innerHTML = html;
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+// ─── 页面：AI 助手 ──────────────────────────────────
+
+PAGES.agent = function() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div class="card">
+      <h2>🤖 AI 助手</h2>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">用自然语言管理文件</p>
+      <div class="chat-box" id="chatBox">
+        <div class="chat-msg system">你好！我是 AI 助手，可以帮你搜索文件、查看文件信息、列出文件、总结文件内容。</div>
+      </div>
+      <div class="chat-input">
+        <input type="text" id="chatInput" placeholder="例如：帮我找一下关于数据库的文档" onkeydown="if(event.key==='Enter') doAgentChat()">
+        <button class="btn btn-primary" onclick="doAgentChat()">发送</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('chatInput').focus();
+};
+
+async function doAgentChat() {
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+
+  const box = document.getElementById('chatBox');
+  box.innerHTML += `<div class="chat-msg user">${escapeHtml(msg)}</div>`;
+  box.innerHTML += `<div class="chat-msg assistant" style="color:var(--text-secondary)">思考中...</div>`;
+  box.scrollTop = box.scrollHeight;
+
+  try {
+    const data = await API.agentChat(msg);
+    const answerDiv = box.querySelector('.chat-msg.assistant:last-child');
+    answerDiv.textContent = data.response || '无响应';
+    answerDiv.style.color = '';
+    box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    const answerDiv = box.querySelector('.chat-msg.assistant:last-child');
+    answerDiv.textContent = '请求失败: ' + e.message;
+    answerDiv.style.color = 'var(--danger)';
+  }
+}
+
+// ─── 工具函数 ──────────────────────────────────────
+
+function showMsg(id, text, type) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = `<div class="msg msg-${type}">${escapeHtml(text)}</div>`;
+}
+
+function hideMsg(id) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = '';
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ─── 初始化 ────────────────────────────────────────
+
+(function init() {
+  const page = location.hash.slice(1) || 'login';
+  if (!API.isLoggedIn() && page !== 'register') {
+    showPage('login');
+  } else {
+    showPage(page);
+  }
+})();
+</script>
+</body>
+</html>
